@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Xero Credit Note Allocation Tool</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .connected { background: #d4edda; color: #155724; }
+        .disconnected { background: #f8d7da; color: #721c24; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .info { background: #d1ecf1; color: #0c5460; }
+        button { padding: 10px 18px; margin: 6px; cursor: pointer; border: none; border-radius: 4px; background: #007bff; color: white; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        button.danger { background: #dc3545; }
+        button.danger:hover { background: #c82333; }
+        input { padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 4px; }
+        .button-group { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+        .button-group button { margin: 0; }
+        h2 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }
+        hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+        #tenantModal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
+        #tenantModal > div { background: white; margin: 80px auto; padding: 20px; width: 420px; border-radius: 6px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="container">
+        <div style="
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: white;
+        ">
+            <h1 style="margin: 0;">🔗 Xero Credit Note Allocation Tool</h1>
+
+            <img 
+                src="data:image/png;base64,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"
+                alt="MMC Convert Logo"
+                style="max-width: 125px; height: auto; opacity: 1; z-index: 999; position: relative; display: block; margin: 0 auto;"
+                onerror="this.onerror=null; this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%2260%22><text x=%2250%%22 y=%2250%%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-family=%22Arial%22 font-size=%2224%22 fill=%22%23007bff%22 font-weight=%22bold%22>MMC Convert</text></svg>';" 
+            >
+        </div>
+
+        <div class="status {% if org_name %}connected{% else %}disconnected{% endif %}">
+            {% if org_name %}
+                <strong>✓ Connected Organisation:</strong> {{ org_name }}
+            {% else %}
+                <strong>✗ Status:</strong> Not connected to Xero
+            {% endif %}
+        </div>
+
+        {% if not org_name %}
+        <div>
+            <h2>Connect Xero</h2>
+            <button onclick="connectXero()">🔐 Connect to Xero</button>
+        </div>
+        {% else %}
+        <div>
+            <h2>List of Organization</h2>
+            <button onclick="listTenants()">🏢 Switch Organization</button>
+            <button onclick="resetAuth()" class="danger">🔄 Reset Connection</button>
+        </div>
+        {% endif %}
+
+        <hr>
+
+        <div>
+            <h2>Extract & Download</h2>
+            <div>
+                <label>📅 Start Date:</label>
+                <input type="date" id="start_date">
+                <label>📅 End Date:</label>
+                <input type="date" id="end_date">
+            </div>
+            
+            <div style="margin-top: 15px;">
+                <h3 style="font-size: 14px; color: #555; margin: 10px 0 8px 0;">Credit Note Allocations:</h3>
+                <div class="button-group">
+                    <button onclick="download('invoice')" {% if not org_name %}disabled{% endif %}>📄 Invoice Allocations</button>
+                    <button onclick="download('bill')" {% if not org_name %}disabled{% endif %}>📋 Bill Allocations</button>
+                </div>
+            </div>
+
+            <div style="margin-top: 15px;">
+                <h3 style="font-size: 14px; color: #555; margin: 10px 0 8px 0;">Overpayment Allocations:</h3>
+                <div class="button-group">
+                    <button onclick="download('receive_overpayment')" {% if not org_name %}disabled{% endif %}>📥 Receive Overpayments</button>
+                    <button onclick="download('spend_overpayment')" {% if not org_name %}disabled{% endif %}>📤 Spend Overpayments</button>
+                </div>
+            </div>
+
+            <div style="margin-top: 15px;">
+                <button onclick="download('all')" {% if not org_name %}disabled{% endif %} style="background: #28a745;">⬇️ Download All (4 sheets)</button>
+            </div>
+        </div>
+
+        <div id="status" style="margin-top: 20px;"></div>
+
+        <div id="tenantModal">
+            <div>
+                <h3>🏢 Select Organization</h3>
+                <div id="tenantList" style="max-height: 350px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 8px; margin-bottom: 15px;"></div>
+                <div id="tenantList"></div>
+                <button onclick="closeModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function connectXero() {
+            window.location.href = '/auth';
+        }
+
+        function resetAuth() {
+            if (confirm('Are you sure? This will reset all connection data.')) {
+                window.location.href = '/reset';
+            }
+        }
+
+        function listTenants() {
+            fetch('/tenants').then(r => r.json()).then(data => {
+                if (data.tenants) {
+                    const tenantList = document.getElementById('tenantList');
+                    tenantList.innerHTML = '';
+                    data.tenants.forEach(tenant => {
+                        const btn = document.createElement('button');
+                        btn.textContent = tenant.tenantName;
+                        btn.style.display = 'block';
+                        btn.style.margin = '6px 0';
+                        btn.style.width = '100%';
+                        btn.onclick = () => switchTenant(tenant.tenantId);
+                        tenantList.appendChild(btn);
+                    });
+                    document.getElementById('tenantModal').style.display = 'block';
+                } else {
+                    showStatus('No tenants found', 'error');
+                }
+            }).catch(e => showStatus('Error fetching tenants: ' + e, 'error'));
+        }
+
+        function switchTenant(tenantId) {
+            fetch('/switch_tenant', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tenant_id: tenantId})
+            }).then(r => r.json()).then(data => {
+                if (data.message) {
+                    showStatus(data.message, 'success');
+                    closeModal();
+                    setTimeout(() => location.reload(), 800);
+                } else {
+                    showStatus(data.error || 'Error switching tenant', 'error');
+                }
+            }).catch(e => showStatus('Error switching tenant: ' + e, 'error'));
+        }
+
+        function closeModal() {
+            document.getElementById('tenantModal').style.display = 'none';
+        }
+
+        function showStatus(msg, kind) {
+            const div = document.getElementById('status');
+            div.innerHTML = `<div class="status ${kind || 'info'}">${msg}</div>`;
+        }
+
+        function download(type) {
+            const start = document.getElementById('start_date').value;
+            const end = document.getElementById('end_date').value;
+            if (!start || !end) {
+                showStatus('⚠️ Select both start and end dates', 'error');
+                return;
+            }
+            showStatus('⏳ Preparing download...', 'info');
+            const url = `/extract/download/${type}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+            window.location.href = url;
+            setTimeout(() => showStatus('✓ File downloading...', 'success'), 1000);
+        }
+    </script>
+</body>
+</html>
+
