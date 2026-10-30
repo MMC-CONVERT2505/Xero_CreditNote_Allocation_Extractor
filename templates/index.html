@@ -97,7 +97,14 @@
             <div style="margin-top: 15px;">
                 <button onclick="download('all')" {% if not org_name %}disabled{% endif %} style="background: #28a745;">⬇️ Download All (4 sheets)</button>
             </div>
-        </div>
+        </div>{% if removal_enabled %}
+
+        <hr>
+        <div>
+            <h2>Allocation Removal</h2>
+            <p style="color: #555; font-size: 14px;">Remove credit note, bill credit and overpayment allocations. Only the allocation link is removed; the original transactions are never deleted.</p>
+            <a href="{{ url_for('allocations.page') }}"><button type="button" class="danger">&#129529; Delete Allocation </button></a>
+        </div>{% endif %}
 
         <div id="status" style="margin-top: 20px;"></div>
 

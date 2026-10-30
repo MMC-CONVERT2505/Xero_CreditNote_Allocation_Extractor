@@ -4,26 +4,50 @@ import requests
 import pandas as pd
 from io import BytesIO
 from datetime import datetime
+import hmac
+import secrets
 from flask import (
     Flask, request, session, jsonify, send_file,
     render_template, redirect, url_for
 )
 from dotenv import load_dotenv
+from urllib.parse import urlsplit
+
+import allocation_removal
+import token_store
 
 # LOAD ENV
 load_dotenv()
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = "http://localhost:5000/callback"
+REDIRECT_URI = os.getenv("XERO_REDIRECT_URI", "http://localhost:5000/callback")
 BASE_URL = "https://api.xero.com/api.xro/2.0"
 TOKEN_URL = "https://identity.xero.com/connect/token"
-TOKEN_FILE = "xero_tokens.json"
+TOKEN_FILE = os.getenv("XERO_TOKEN_FILE", "xero_tokens.json")
+XERO_SCOPES = os.getenv("XERO_SCOPES", "offline_access accounting.transactions accounting.contacts")
 
 
 # FLASK APP
 app = Flask(__name__)
-app.secret_key = "fixed_secret_key_2024"
+# Set SECRET_KEY in the environment. The legacy default is kept only so existing deployments keep working;
+# the Allocation Removal feature refuses to enable itself while it is in use.
+LEGACY_SECRET_KEY = "fixed_secret_key_2024"
+app.secret_key = os.getenv("SECRET_KEY") or LEGACY_SECRET_KEY
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "").lower() == "true"
+LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+
+
+@app.before_request
+def use_redirect_uri_host():
+    """Local use only: 127.0.0.1 and localhost have separate cookies, so a login started on one and returned
+    to the other fails the OAuth state check. Send the browser to the host named in the redirect URI."""
+    want = urlsplit(REDIRECT_URI)
+    have = (request.host or "").split(":")[0]
+    if (request.method == "GET" and have in LOCAL_HOSTS and want.hostname in LOCAL_HOSTS
+            and have != want.hostname):
+        return redirect(f"{want.scheme}://{want.netloc}{request.full_path.rstrip('?')}")
 
 # ============================================
 # TOKEN HELPERS (your existing helpers, slightly reused)
@@ -34,15 +58,11 @@ def save_token(token_data, connections_data=None):
     if connections_data and len(connections_data) > 0:
         token_data["tenant_id"] = connections_data[0]["tenantId"]
         token_data["tenant_name"] = connections_data[0]["tenantName"]
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(token_data, f, indent=2)
+    token_store.save(TOKEN_FILE, token_data)
 
 
 def load_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as f:
-            return json.load(f)
-    return None
+    return token_store.load(TOKEN_FILE)
 
 def refresh_access_token(refresh_token):
     data = {
@@ -51,7 +71,7 @@ def refresh_access_token(refresh_token):
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
     }
-    response = requests.post(TOKEN_URL, data=data)
+    response = requests.post(TOKEN_URL, data=data, timeout=30)
     if response.status_code != 200:
         raise Exception(f"Token refresh failed: {response.text}")
 
@@ -62,20 +82,38 @@ def refresh_access_token(refresh_token):
         new_tokens['tenant_id'] = old_token['tenant_id']
         new_tokens['tenant_name'] = old_token['tenant_name']
     save_token(new_tokens)
-    session["token"] = new_tokens
     return new_tokens
+
+def _token_expired(token):
+    expires_in = token.get("expires_in", 1800)
+    created_at = token.get("created_at", 0)
+    return datetime.now().timestamp() - created_at > expires_in - 300
 
 def get_valid_token():
     token = load_token()
     if not token:
         raise Exception("No Xero token found. Please authenticate first.")
 
-    expires_in = token.get("expires_in", 1800)
-    created_at = token.get("created_at", 0)
-
-    if datetime.now().timestamp() - created_at > expires_in - 300:
-        return refresh_access_token(token["refresh_token"])
+    if _token_expired(token):
+        # Xero refresh tokens are single-use: refresh under a lock and re-check inside it, so a concurrent
+        # request/worker that already refreshed is not followed by a second (failing) refresh.
+        with token_store.locked(TOKEN_FILE):
+            token = load_token()
+            if not token:
+                raise Exception("No Xero token found. Please authenticate first.")
+            if _token_expired(token):
+                return refresh_access_token(token["refresh_token"])
     return token
+
+def force_refresh_token(rejected_access_token):
+    """Refresh after Xero answered 401 for `rejected_access_token` (unless someone else already refreshed)."""
+    with token_store.locked(TOKEN_FILE):
+        token = load_token()
+        if not token:
+            raise Exception("No Xero token found. Please authenticate first.")
+        if token.get("access_token") != rejected_access_token:
+            return token
+        return refresh_access_token(token["refresh_token"])
 
 # Helper: access token string for one-off calls
 def get_access_token():
@@ -86,7 +124,7 @@ def get_access_token():
 # TENANT MANAGEMENT
 # ============================================
 def get_tenant_info():
-    token = session.get("token") or load_token()
+    token = load_token()
     if not token:
         return None
     if 'tenant_id' in token and 'tenant_name' in token:
@@ -150,7 +188,6 @@ def switch_tenant():
                 token['tenant_id'] = selected_tenant['tenantId']
                 token['tenant_name'] = selected_tenant['tenantName']
                 save_token(token)
-                session["token"] = token
                 session["org_name"] = selected_tenant['tenantName']
 
                 return jsonify({"message": f"Switched to {selected_tenant['tenantName']}", "new_tenant": selected_tenant['tenantName']})
@@ -403,18 +440,21 @@ def home():
         if org_name:
             session["org_name"] = org_name
 
-    return render_template("index.html", org_name=org_name, is_authenticated=bool(token))
+    return render_template("index.html", org_name=org_name, is_authenticated=bool(token),
+                           removal_enabled=allocation_removal.removal_enabled())
 
 @app.route("/auth")
 def auth():
     """Redirect to Xero authentication."""
+    state = secrets.token_urlsafe(24)
+    session["oauth_state"] = state
     auth_url = (
         "https://login.xero.com/identity/connect/authorize"
         "?response_type=code"
         f"&client_id={CLIENT_ID}"
         f"&redirect_uri={REDIRECT_URI}"
-        "&scope=offline_access accounting.transactions accounting.contacts"
-        "&state=123456"
+        f"&scope={XERO_SCOPES}"
+        f"&state={state}"
     )
     return redirect(auth_url)
 
@@ -425,6 +465,11 @@ def callback():
     if error:
         error_desc = request.args.get('error_description', 'No description')
         return f"Authentication Failed: {error} - {error_desc}", 400
+
+    expected_state = session.pop("oauth_state", None)  # single use
+    received_state = request.args.get("state") or ""
+    if not expected_state or not hmac.compare_digest(expected_state.encode(), received_state.encode()):
+        return "Authentication Failed: invalid OAuth state. Please start again from the home page.", 400
 
     code = request.args.get('code')
     if not code:
@@ -456,7 +501,6 @@ def callback():
                 session["org_name"] = connections_data[0]["tenantName"]
 
         save_token(token_data, connections_data)
-        session["token"] = token_data
         return '''
         <h3> Successfully Connected to Xero!</h3>
         <p><strong>Organization:</strong> {}</p>
@@ -532,6 +576,20 @@ def reset():
     <p>All tokens and session data cleared.</p>
     <a href="/">Go Home</a>
     """
+
+# ============================================
+# TOKEN STORE ERRORS + ALLOCATION REMOVAL (feature flagged, off by default)
+# ============================================
+@app.errorhandler(token_store.TokenStoreError)
+def handle_token_store_error(exc):
+    return jsonify({"error": str(exc)}), 500
+
+allocation_removal.register(
+    app,
+    get_valid_token=get_valid_token,
+    force_refresh=force_refresh_token,
+    get_tenant_info=get_tenant_info,
+)
 
 # ============================================
 # MAIN

@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>Xero Allocation Removal</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1250px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .connected { background: #d4edda; color: #155724; }
+        .disconnected, .error { background: #f8d7da; color: #721c24; }
+        .success { background: #d4edda; color: #155724; }
+        .info { background: #d1ecf1; color: #0c5460; }
+        .warn { background: #fff3cd; color: #856404; }
+        button { padding: 9px 16px; margin: 4px; cursor: pointer; border: none; border-radius: 4px; background: #007bff; color: white; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        button.danger { background: #dc3545; } button.danger:hover { background: #c82333; }
+        button.secondary { background: #6c757d; } button.secondary:hover { background: #545b62; }
+        button.tab { background: #e9ecef; color: #333; } button.tab.active { background: #007bff; color: white; }
+        button.link { background: none; color: #007bff; padding: 0; margin: 0; font-weight: normal; text-decoration: underline; }
+        input, select { padding: 7px; margin: 3px; border: 1px solid #ddd; border-radius: 4px; }
+        h1 { margin: 0; } h2 { color: #333; border-bottom: 2px solid #dc3545; padding-bottom: 10px; }
+        .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin: 12px 0; }
+        .filters label { font-size: 12px; color: #555; display: flex; flex-direction: column; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 8px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
+        th { background: #fafafa; font-size: 11px; text-transform: uppercase; color: #666; }
+        td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+        .mono { font-family: Consolas, monospace; font-size: 11px; color: #555; word-break: break-all; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; background: #e9ecef; }
+        .b-ok { background: #d4edda; color: #155724; } .b-bad { background: #f8d7da; color: #721c24; } .b-warn { background: #fff3cd; color: #856404; }
+        .scroll { overflow-x: auto; }
+        #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; }
+        #modal > div { background: white; margin: 5vh auto; padding: 22px; width: min(860px, 94vw); max-height: 88vh; overflow: auto; border-radius: 6px; }
+        .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <h1>&#129529; Xero Allocation Removal</h1>
+        <a href="{{ url_for('home') }}">&larr; Back to extraction tool</a>
+    </div>
+
+    {% if not connected %}
+    <div class="status disconnected"><strong>&#10007; Not connected to Xero.</strong> <a href="{{ url_for('auth') }}">Connect to Xero</a> on the extraction page first.</div>
+    {% else %}
+    <div class="status connected"><strong>&#10003; Connected Organisation:</strong> {{ org_name }}
+        <span id="stats" style="float:right"></span></div>
+    {% if removal_blocked %}
+    <div class="status warn"><strong>Removal is blocked for this organisation</strong> (not listed in REMOVAL_ALLOWED_TENANT_IDS). You can still view allocations.</div>
+    {% endif %}
+    <div class="status info">This tool removes only the <strong>allocation link</strong> between a credit note / overpayment and an invoice or bill. The original transactions are <strong>never deleted</strong>, and every removal is verified by re-fetching the document from Xero.</div>
+
+    <div id="tabs">
+        <button class="tab active" data-m="credit_note">Credit Notes <span class="count"></span></button>
+        <button class="tab" data-m="bill_credit">Bill Credits <span class="count"></span></button>
+        <button class="tab" data-m="overpayment">Overpayments <span class="count"></span></button>
+    </div>
+
+    <div class="filters">
+        <label>Search<input id="f_search" placeholder="Number, contact, invoice, ID"></label>
+        <label>Status<select id="f_status"><option value="">All</option><option>AUTHORISED</option><option>PAID</option><option>VOIDED</option></select></label>
+        <label>Document date from<input type="date" id="f_from"></label>
+        <label>to<input type="date" id="f_to"></label>
+        <button id="btn_refresh" class="secondary">Refresh from Xero</button>
+        <span id="loading" style="display:none">&#9203; Loading&hellip;</span>
+    </div>
+
+    <div id="notice"></div>
+
+    <div class="row-actions">
+        <span><span id="sel_count">0</span> selected</span>
+        <button id="btn_remove" class="danger" disabled>Remove Allocation</button>
+    </div>
+
+    <div class="scroll">
+    <table>
+        <thead><tr>
+            <th><input type="checkbox" id="sel_all" title="Select all removable rows on this page"></th>
+            <th id="h_parent">Credit Note</th><th>Contact</th><th>Status</th><th class="num">Total</th>
+            <th class="num">Allocated</th><th>Alloc. date</th><th id="h_related">Invoice</th><th>IDs</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+    </table>
+    </div>
+
+    <div class="row-actions" style="margin-top:10px">
+        <span id="page_info"></span>
+        <span>
+            <select id="page_size"><option>10</option><option selected>25</option><option>50</option><option>100</option></select>
+            <button id="btn_prev" class="secondary">Previous</button>
+            <button id="btn_next" class="secondary">Next</button>
+        </span>
+    </div>
+
+    <div id="results" style="margin-top:20px"></div>
+    {% endif %}
+</div>
+
+<div id="modal"><div role="dialog" aria-modal="true" aria-labelledby="m_title">
+    <h2 id="m_title">Remove allocation?</h2>
+    <p>This removes only the <strong>allocation link</strong>. The original transactions are <strong>not deleted</strong>; the amounts become unallocated again.</p>
+    <div class="scroll"><table><thead><tr><th>Transaction</th><th>Contact</th><th>Invoice / Bill</th><th class="num">Amount</th><th>Allocation ID</th></tr></thead><tbody id="m_rows"></tbody></table></div>
+    <p><label><input type="checkbox" id="m_ack"> I understand that only the selected allocation(s) will be removed in Xero.</label></p>
+    <div style="text-align:right">
+        <button id="m_cancel" class="secondary">Cancel</button>
+        <button id="m_ok" class="danger" disabled>Remove Allocation</button>
+    </div>
+</div></div>
+
+<script>
+(function () {
+    {% if connected %}
+    var CSRF = document.querySelector('meta[name="csrf-token"]').content;
+    var REMOVAL_BLOCKED = {{ 'true' if removal_blocked else 'false' }};
+    var MAX_BULK = 50;
+    var LABELS = {
+        credit_note: {parent: 'Credit Note', related: 'Invoice'},
+        bill_credit: {parent: 'Supplier Credit Note', related: 'Bill'},
+        overpayment: {parent: 'Overpayment', related: 'Invoice / Bill'}
+    };
+    var st = {module: 'credit_note', page: 1, selected: {}, busy: false, data: null, reqId: 0};
+    var $ = function (id) { return document.getElementById(id); };
+
+    function h(tag, props, kids) {
+        var e = document.createElement(tag);
+        Object.keys(props || {}).forEach(function (k) {
+            if (k === 'class') e.className = props[k]; else if (k === 'text') e.textContent = props[k]; else e.setAttribute(k, props[k]);
+        });
+        (kids || []).forEach(function (c) { e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+        return e;
+    }
+    function money(v, cur) {
+        if (v === null || v === undefined) return '—';
+        try { return new Intl.NumberFormat(undefined, {style: 'currency', currency: cur || 'USD', currencyDisplay: cur ? 'code' : 'symbol'}).format(v); }
+        catch (e) { return String(v); }
+    }
+    function short(id) { return id ? '…' + String(id).slice(-6) : '—'; }
+    function parentLabel(r) { return r.parentNumber || r.reference || ((r.type || LABELS[r.module].parent) + ' ' + short(r.parentId)); }
+    function notice(kind, msg) { var n = $('notice'); n.innerHTML = ''; if (msg) n.appendChild(h('div', {class: 'status ' + kind, text: msg})); }
+
+    function api(path, opts) {
+        opts = opts || {};
+        var headers = {'Accept': 'application/json'};
+        if (opts.body) { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = CSRF; }
+        return fetch('api/' + path, {method: opts.body ? 'POST' : 'GET', headers: headers, credentials: 'same-origin', body: opts.body ? JSON.stringify(opts.body) : undefined})
+            .then(function (r) { return r.json().catch(function () { return {ok: false, message: 'Unexpected server response (' + r.status + ').'}; }).then(function (j) { j._http = r.status; return j; }); });
+    }
+
+    function query() {
+        var p = new URLSearchParams({page: st.page, pageSize: $('page_size').value});
+        [['search', 'f_search'], ['status', 'f_status'], ['from', 'f_from'], ['to', 'f_to']].forEach(function (x) { if ($(x[1]).value) p.set(x[0], $(x[1]).value); });
+        return p;
+    }
+
+    function load(force) {
+        var id = ++st.reqId;
+        $('loading').style.display = '';
+        var p = query(); if (force) p.set('refresh', '1');
+        return api(st.module + '/list?' + p.toString()).then(function (d) {
+            if (id !== st.reqId) return;
+            $('loading').style.display = 'none';
+            if (d.ok === false || d.error) { notice('error', d.message || 'Could not load allocations.'); st.data = null; render(); return; }
+            notice('', '');
+            if (d.truncated) notice('warn', 'Only the first pages returned by Xero are shown (safety cap). Narrow the document date range to see the rest.');
+            st.data = d; st.page = d.page; render();
+            var tab = document.querySelector('#tabs button[data-m="' + st.module + '"] .count'); if (tab) tab.textContent = '(' + d.total + ')';
+        });
+    }
+
+    function render() {
+        var L = LABELS[st.module], d = st.data, body = $('rows');
+        $('h_parent').textContent = L.parent; $('h_related').textContent = L.related;
+        body.innerHTML = '';
+        var rows = d ? d.rows : [];
+        if (!rows.length) body.appendChild(h('tr', {}, [h('td', {colspan: '9', text: d ? 'No allocations found for these filters.' : 'Nothing loaded.'})]));
+        rows.forEach(function (r) {
+            var cb = h('input', {type: 'checkbox'});
+            cb.checked = !!st.selected[r.rowKey];
+            cb.disabled = !r.removable || st.busy || REMOVAL_BLOCKED;
+            if (r.notRemovableReason) cb.title = r.notRemovableReason;
+            cb.addEventListener('change', function () { if (cb.checked) st.selected[r.rowKey] = r; else delete st.selected[r.rowKey]; updateSel(); });
+            var ids = h('div', {class: 'mono'}, [
+                h('div', {text: 'Doc: ' + r.parentId}), h('div', {text: 'Allocation: ' + (r.allocationId || '—')}),
+                h('div', {text: (L.related) + ' ID: ' + (r.relatedDocumentId || '—')})]);
+            if (r.notRemovableReason) ids.appendChild(h('div', {class: 'badge b-warn', text: 'Not removable: ' + r.notRemovableReason}));
+            body.appendChild(h('tr', {}, [
+                h('td', {}, [cb]),
+                h('td', {}, [h('strong', {text: parentLabel(r)}), h('div', {class: 'mono', text: r.type || ''})]),
+                h('td', {text: r.contactName || '—'}),
+                h('td', {}, [h('span', {class: 'badge', text: r.status || '—'})]),
+                h('td', {class: 'num', text: money(r.total, r.currency)}),
+                h('td', {class: 'num', text: money(r.allocationAmount, r.currency)}),
+                h('td', {text: r.allocationDate || '—'}),
+                h('td', {text: r.relatedDocumentNumber || '—'}),
+                h('td', {}, [ids])]));
+        });
+        $('page_info').textContent = d ? d.total + ' allocation(s) · page ' + d.page + ' of ' + d.totalPages : '';
+        $('btn_prev').disabled = !d || d.page <= 1; $('btn_next').disabled = !d || d.page >= d.totalPages;
+        updateSel();
+    }
+
+    function selectedRows() { return Object.keys(st.selected).map(function (k) { return st.selected[k]; }); }
+    function updateSel() {
+        var n = selectedRows().length;
+        $('sel_count').textContent = n;
+        $('btn_remove').disabled = !n || st.busy || REMOVAL_BLOCKED;
+        $('btn_remove').textContent = n > 1 ? 'Remove Allocations' : 'Remove Allocation';
+        var removable = st.data ? st.data.rows.filter(function (r) { return r.removable; }) : [];
+        $('sel_all').checked = removable.length > 0 && removable.every(function (r) { return st.selected[r.rowKey]; });
+    }
+
+    function openModal() {
+        var rows = selectedRows(), tb = $('m_rows'), L = LABELS[st.module];
+        tb.innerHTML = '';
+        rows.forEach(function (r) {
+            tb.appendChild(h('tr', {}, [h('td', {text: parentLabel(r)}), h('td', {text: r.contactName || '—'}),
+                h('td', {text: r.relatedDocumentNumber || short(r.relatedDocumentId)}),
+                h('td', {class: 'num', text: money(r.allocationAmount, r.currency)}), h('td', {class: 'mono', text: r.allocationId})]));
+        });
+        $('m_title').textContent = 'Remove ' + rows.length + ' allocation' + (rows.length > 1 ? 's' : '') + '? (' + L.parent + ')';
+        $('m_ack').checked = false; $('m_ok').disabled = true;
+        if (rows.length > MAX_BULK) notice('error', 'At most ' + MAX_BULK + ' allocations can be removed at once.');
+        $('modal').style.display = 'block'; $('m_cancel').focus();
+    }
+    function closeModal() { if (!st.busy) $('modal').style.display = 'none'; }
+
+    function confirmRemove() {
+        if (st.busy) return;                       // prevent duplicate submissions
+        var rows = selectedRows();
+        if (!rows.length || rows.length > MAX_BULK) return;
+        st.busy = true; $('m_ok').disabled = true; $('m_ok').textContent = 'Removing…'; updateSel();
+        var items = rows.map(function (r) { return {parentId: r.parentId, allocationId: r.allocationId, expectedAmount: r.allocationAmount}; });
+        var req = rows.length === 1
+            ? api(st.module + '/remove', {body: Object.assign({confirm: true}, items[0])}).then(function (res) { return res.results ? res : {results: [res]}; })
+            : api(st.module + '/remove-bulk', {body: {confirm: true, items: items}});
+        req.then(function (res) {
+            var list = res.results || [{ok: false, status: 'FAILED', message: res.message || 'Request failed.', allocationId: ''}];
+            showResults(list);
+            list.forEach(function (x) { if (x.ok) Object.keys(st.selected).forEach(function (k) { if (st.selected[k].allocationId === x.allocationId) delete st.selected[k]; }); });
+        }).catch(function () { showResults([{ok: false, status: 'FAILED', message: 'Network error. Nothing was confirmed; refresh and check the list.', allocationId: ''}]); })
+          .then(function () {
+            st.busy = false; $('m_ok').textContent = 'Remove Allocation'; $('modal').style.display = 'none';
+            load(true); loadStats();
+        });
+    }
+
+    function showResults(list) {
+        var ok = list.filter(function (x) { return x.ok; }).length, box = $('results');
+        box.innerHTML = '';
+        box.appendChild(h('div', {class: 'status ' + (ok === list.length ? 'success' : ok ? 'info' : 'error'),
+            text: ok + ' of ' + list.length + ' allocation(s) removed and verified.'}));
+        var tb = h('tbody');
+        list.forEach(function (x) {
+            var cls = x.ok ? 'b-ok' : (x.status === 'UNVERIFIED' ? 'b-warn' : 'b-bad');
+            tb.appendChild(h('tr', {}, [h('td', {}, [h('span', {class: 'badge ' + cls, text: x.ok ? 'Removed & verified' : (x.status || 'FAILED')})]),
+                h('td', {class: 'mono', text: x.allocationId || ''}), h('td', {text: x.message || ''})]));
+        });
+        box.appendChild(h('table', {}, [h('thead', {}, [h('tr', {}, [h('th', {text: 'Result'}), h('th', {text: 'Allocation ID'}), h('th', {text: 'Details'})])]), tb]));
+    }
+
+    function loadStats() {
+        api('status').then(function (s) { if (s.stats) $('stats').textContent = 'Verified removals: ' + s.stats.succeeded + ' · Failed: ' + s.stats.failed; });
+    }
+
+    document.querySelectorAll('#tabs button').forEach(function (b) {
+        b.addEventListener('click', function () {
+            if (st.busy) return;
+            document.querySelectorAll('#tabs button').forEach(function (x) { x.classList.remove('active'); });
+            b.classList.add('active'); st.module = b.dataset.m; st.page = 1; st.selected = {}; $('results').innerHTML = ''; load(false);
+        });
+    });
+    var debounce; $('f_search').addEventListener('input', function () { clearTimeout(debounce); debounce = setTimeout(function () { st.page = 1; load(false); }, 300); });
+    ['f_status', 'f_from', 'f_to', 'page_size'].forEach(function (id) { $(id).addEventListener('change', function () { st.page = 1; load(false); }); });
+    $('btn_refresh').addEventListener('click', function () { load(true); });
+    $('btn_prev').addEventListener('click', function () { st.page -= 1; load(false); });
+    $('btn_next').addEventListener('click', function () { st.page += 1; load(false); });
+    $('sel_all').addEventListener('change', function (e) {
+        (st.data ? st.data.rows : []).forEach(function (r) { if (r.removable) { if (e.target.checked) st.selected[r.rowKey] = r; else delete st.selected[r.rowKey]; } });
+        render();
+    });
+    $('btn_remove').addEventListener('click', openModal);
+    $('m_cancel').addEventListener('click', closeModal);
+    $('m_ack').addEventListener('change', function () { $('m_ok').disabled = !$('m_ack').checked || st.busy; });
+    $('m_ok').addEventListener('click', confirmRemove);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+
+    load(false); loadStats();
+    {% endif %}
+})();
+</script>
+</body>
+</html>
