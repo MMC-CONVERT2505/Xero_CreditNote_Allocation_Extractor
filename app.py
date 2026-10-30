@@ -11,6 +11,7 @@ from flask import (
     render_template, redirect, url_for
 )
 from dotenv import load_dotenv
+from urllib.parse import urlsplit
 
 import allocation_removal
 import token_store
@@ -35,6 +36,18 @@ LEGACY_SECRET_KEY = "fixed_secret_key_2024"
 app.secret_key = os.getenv("SECRET_KEY") or LEGACY_SECRET_KEY
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "").lower() == "true"
+LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+
+
+@app.before_request
+def use_redirect_uri_host():
+    """Local use only: 127.0.0.1 and localhost have separate cookies, so a login started on one and returned
+    to the other fails the OAuth state check. Send the browser to the host named in the redirect URI."""
+    want = urlsplit(REDIRECT_URI)
+    have = (request.host or "").split(":")[0]
+    if (request.method == "GET" and have in LOCAL_HOSTS and want.hostname in LOCAL_HOSTS
+            and have != want.hostname):
+        return redirect(f"{want.scheme}://{want.netloc}{request.full_path.rstrip('?')}")
 
 # ============================================
 # TOKEN HELPERS (your existing helpers, slightly reused)
