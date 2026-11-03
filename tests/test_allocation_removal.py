@@ -70,7 +70,7 @@ class FeatureFlagTests(AppTestCase):
     def test_enabled_shows_link_and_page_renders_with_csrf_meta(self):
         self.write_token()
         os.environ["ENABLE_ALLOCATION_REMOVAL"] = "true"
-        self.assertIn("Open Allocation Removal", self.client.get("/").get_data(as_text=True))
+        self.assertIn('href="/allocations/"', self.client.get("/").get_data(as_text=True))
         page = self.client.get("/allocations/").get_data(as_text=True)
         with self.client.session_transaction() as s:
             self.assertIn(s["csrf_token"], page)

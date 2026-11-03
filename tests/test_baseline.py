@@ -58,7 +58,7 @@ def golden(testcase, name, html):
     if os.environ.get("UPDATE_GOLDEN") == "1":
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(html)
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with open(path, "r", encoding="utf-8") as f:
         testcase.assertEqual(html, f.read(), f"home page HTML changed vs golden {name}")
 
 

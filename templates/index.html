@@ -103,7 +103,7 @@
         <div>
             <h2>Allocation Removal</h2>
             <p style="color: #555; font-size: 14px;">Remove credit note, bill credit and overpayment allocations. Only the allocation link is removed; the original transactions are never deleted.</p>
-            <a href="{{ url_for('allocations.page') }}"><button type="button" class="danger">&#129529; Delete Allocation </button></a>
+            <a href="{{ base_path }}/allocations/"><button type="button" class="danger">&#129529; Delete Allocation </button></a>
         </div>{% endif %}
 
         <div id="status" style="margin-top: 20px;"></div>
@@ -120,17 +120,17 @@
 
     <script>
         function connectXero() {
-            window.location.href = '/auth';
+            window.location.href = '{{ base_path }}/auth';
         }
 
         function resetAuth() {
             if (confirm('Are you sure? This will reset all connection data.')) {
-                window.location.href = '/reset';
+                window.location.href = '{{ base_path }}/reset';
             }
         }
 
         function listTenants() {
-            fetch('/tenants').then(r => r.json()).then(data => {
+            fetch('{{ base_path }}/tenants').then(r => r.json()).then(data => {
                 if (data.tenants) {
                     const tenantList = document.getElementById('tenantList');
                     tenantList.innerHTML = '';
@@ -151,7 +151,7 @@
         }
 
         function switchTenant(tenantId) {
-            fetch('/switch_tenant', {
+            fetch('{{ base_path }}/switch_tenant', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({tenant_id: tenantId})
@@ -183,7 +183,7 @@
                 return;
             }
             showStatus('⏳ Preparing download...', 'info');
-            const url = `/extract/download/${type}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+            const url = `{{ base_path }}/extract/download/${type}?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
             window.location.href = url;
             setTimeout(() => showStatus('✓ File downloading...', 'success'), 1000);
         }
