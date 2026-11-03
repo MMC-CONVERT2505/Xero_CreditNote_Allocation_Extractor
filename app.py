@@ -11,6 +11,7 @@ from flask import (
     render_template, redirect, url_for
 )
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 from urllib.parse import urlsplit
 
 import allocation_removal
@@ -21,7 +22,7 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("XERO_REDIRECT_URI", "http://localhost:5000/callback")
+REDIRECT_URI = os.getenv("XERO_REDIRECT_URI") or os.getenv("REDIRECT_URI") or "http://localhost:5000/callback"
 BASE_URL = "https://api.xero.com/api.xro/2.0"
 TOKEN_URL = "https://identity.xero.com/connect/token"
 TOKEN_FILE = os.getenv("XERO_TOKEN_FILE", "xero_tokens.json")
@@ -36,6 +37,18 @@ LEGACY_SECRET_KEY = "fixed_secret_key_2024"
 app.secret_key = os.getenv("SECRET_KEY") or LEGACY_SECRET_KEY
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "").lower() == "true"
+
+# Optional sub-path deployment, e.g. APP_BASE_PATH=/xero-app when nginx serves the app at /xero-app/ and strips the prefix.
+_base = os.getenv("APP_BASE_PATH", "").strip().strip("/")
+BASE_PATH = "/" + _base if _base else ""
+if BASE_PATH:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
+    app.config["APPLICATION_ROOT"] = BASE_PATH
+
+
+@app.context_processor
+def inject_base_path():
+    return {"base_path": BASE_PATH}
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
 
 
@@ -503,10 +516,10 @@ def callback():
         save_token(token_data, connections_data)
         return '''
         <h3> Successfully Connected to Xero!</h3>
-        <p><strong>Organization:</strong> {}</p>
+        <p><strong>Organization:</strong> {org}</p>
         <p>You can now close this window and return to the extraction page.</p>
-        <a href="/">Go to Extraction Page</a>
-        '''.format(connections_data[0]["tenantName"] if connections_data else "Unknown")
+        <a href="{base}/">Go to Extraction Page</a>
+        '''.format(org=connections_data[0]["tenantName"] if connections_data else "Unknown", base=BASE_PATH)
 
     except Exception as e:
         return f"Authentication failed: {str(e)}", 500
@@ -571,10 +584,10 @@ def reset():
         os.remove(TOKEN_FILE)
     
     session.clear()
-    return """
+    return f"""
     <h3>Reset Successful</h3>
     <p>All tokens and session data cleared.</p>
-    <a href="/">Go Home</a>
+    <a href="{BASE_PATH}/">Go Home</a>
     """
 
 # ============================================

@@ -43,11 +43,11 @@
 <div class="container">
     <div class="topbar">
         <h1>&#129529; Xero Allocation Removal</h1>
-        <a href="{{ url_for('home') }}">&larr; Back to extraction tool</a>
+        <a href="{{ base_path }}/">&larr; Back to extraction tool</a>
     </div>
 
     {% if not connected %}
-    <div class="status disconnected"><strong>&#10007; Not connected to Xero.</strong> <a href="{{ url_for('auth') }}">Connect to Xero</a> on the extraction page first.</div>
+    <div class="status disconnected"><strong>&#10007; Not connected to Xero.</strong> <a href="{{ base_path }}/auth">Connect to Xero</a> on the extraction page first.</div>
     {% else %}
     <div class="status connected"><strong>&#10003; Connected Organisation:</strong> {{ org_name }}
         <span id="stats" style="float:right"></span></div>
