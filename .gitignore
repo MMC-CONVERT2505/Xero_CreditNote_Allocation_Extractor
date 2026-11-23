@@ -4,3 +4,6 @@ xero_tokens.json*
 allocation_removal_audit.log
 __pycache__/
 *.pyc
+venv/
+req-local.txt
+allocation_cache_epoch

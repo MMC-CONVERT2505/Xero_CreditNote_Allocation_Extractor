@@ -34,8 +34,10 @@
         .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; background: #e9ecef; }
         .b-ok { background: #d4edda; color: #155724; } .b-bad { background: #f8d7da; color: #721c24; } .b-warn { background: #fff3cd; color: #856404; }
         .scroll { overflow-x: auto; }
-        #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; }
-        #modal > div { background: white; margin: 5vh auto; padding: 22px; width: min(860px, 94vw); max-height: 88vh; overflow: auto; border-radius: 6px; }
+        #modal, #modal_all { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; }
+        #modal > div, #modal_all > div { background: white; margin: 5vh auto; padding: 22px; width: min(860px, 94vw); max-height: 88vh; overflow: auto; border-radius: 6px; }
+        #pg_track { background: #fff; border-radius: 4px; height: 14px; margin: 8px 0; overflow: hidden; border: 1px solid #ddd; }
+        #pg_bar { background: #dc3545; height: 100%; width: 0; transition: width .3s; }
         .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
     </style>
 </head>
@@ -56,6 +58,7 @@
     {% endif %}
     <div class="status info">This tool removes only the <strong>allocation link</strong> between a credit note / overpayment and an invoice or bill. The original transactions are <strong>never deleted</strong>, and every removal is verified by re-fetching the document from Xero.</div>
 
+    <p style="margin:6px 0"><strong>1</strong> Choose the module &rarr; <strong>2</strong> choose the document date range &rarr; <strong>3</strong> click <em>Fetch from Xero</em> &rarr; <strong>4</strong> tick rows, or use <em>Remove all</em>.</p>
     <div id="tabs">
         <button class="tab active" data-m="credit_note">Credit Notes <span class="count"></span></button>
         <button class="tab" data-m="bill_credit">Bill Credits <span class="count"></span></button>
@@ -67,15 +70,27 @@
         <label>Status<select id="f_status"><option value="">All</option><option>AUTHORISED</option><option>PAID</option><option>VOIDED</option></select></label>
         <label>Document date from<input type="date" id="f_from"></label>
         <label>to<input type="date" id="f_to"></label>
-        <button id="btn_refresh" class="secondary">Refresh from Xero</button>
-        <span id="loading" style="display:none">&#9203; Loading&hellip;</span>
+        <button id="btn_refresh">Fetch from Xero</button>
     </div>
 
     <div id="notice"></div>
 
+    <div id="fetchbox" class="status info" style="display:none">&#9203; <span id="fx_text"></span> <button id="fx_stop" class="secondary">Stop</button></div>
+
+    <div id="progress" class="status info" style="display:none">
+        <div><strong id="pg_title">Removing allocations&hellip;</strong> <span id="pg_text"></span></div>
+        <div id="pg_track"><div id="pg_bar"></div></div>
+        <div id="pg_reason"></div>
+        <div><span id="pg_hint">Keep this tab open until it finishes. The table refreshes once, at the end.</span>
+            <button id="pg_stop" class="secondary">Stop after current batch</button></div>
+    </div>
+
     <div class="row-actions">
         <span><span id="sel_count">0</span> selected</span>
-        <button id="btn_remove" class="danger" disabled>Remove Allocation</button>
+        <span>
+            <button id="btn_remove_all" class="danger" disabled title="Removes every allocation that matches the current filters, on all pages, in automatic batches">Remove all (0)</button>
+            <button id="btn_remove" class="danger" disabled>Remove Allocation</button>
+        </span>
     </div>
 
     <div class="scroll">
@@ -113,6 +128,21 @@
     </div>
 </div></div>
 
+<div id="modal_all"><div role="dialog" aria-modal="true" aria-labelledby="ma_title">
+    <h2 id="ma_title">Remove ALL allocations?</h2>
+    <p>This removes only the <strong>allocation links</strong>. The original transactions are <strong>not deleted</strong>; the amounts become unallocated again.</p>
+    <div class="status warn" id="ma_summary"></div>
+    <div id="ma_extra"></div>
+    <div class="scroll"><table><thead><tr><th>Transaction</th><th>Contact</th><th>Invoice / Bill</th><th class="num">Amount</th></tr></thead><tbody id="ma_rows"></tbody></table></div>
+    <p id="ma_more" class="mono"></p>
+    <p><label><input type="checkbox" id="ma_ack"> I understand that ALL of these allocations will be removed in Xero, automatically, batch after batch.</label></p>
+    <p><label>Type the number <strong id="ma_n"></strong> to confirm: <input id="ma_type" autocomplete="off" inputmode="numeric" style="width:110px"></label></p>
+    <div style="text-align:right">
+        <button id="ma_cancel" class="secondary">Cancel</button>
+        <button id="ma_ok" class="danger" disabled>Remove all</button>
+    </div>
+</div></div>
+
 <script>
 (function () {
     {% if connected %}
@@ -124,8 +154,18 @@
         bill_credit: {parent: 'Supplier Credit Note', related: 'Bill'},
         overpayment: {parent: 'Overpayment', related: 'Invoice / Bill'}
     };
-    var st = {module: 'credit_note', page: 1, selected: {}, busy: false, data: null, reqId: 0};
+    var CHUNK = 20;                     // allocations per request during "Remove all" (the server also time-boxes each request)
+    var CALLS_PER_REMOVAL = 3;          // pre-flight fetch + DELETE + verification fetch
+    var FATAL = ['NOT_CONNECTED', 'TOKEN_REFRESH_FAILED', 'XERO_UNAUTHORIZED', 'INSUFFICIENT_SCOPE', 'RATE_LIMIT_DAILY',
+                 'TOKEN_STORE_ERROR', 'CSRF_REJECTED', 'TENANT_NOT_ALLOWED', 'CONFIRMATION_REQUIRED'];
+    var TRANSIENT = ['NETWORK_TIMEOUT', 'NETWORK_ERROR', 'XERO_SERVER_ERROR'];   // a failed page is simply asked again
+    var PAGE_RETRY_DELAYS = [2000, 5000, 10000];
+    var SEARCH_FIELDS = ['parentNumber', 'reference', 'contactName', 'relatedDocumentNumber', 'parentId', 'allocationId'];
+    // rows = everything fetched so far (held in the browser); data = the page of rows currently shown
+    var st = {module: 'credit_note', page: 1, selected: {}, busy: false, running: false, stop: false, all: null, data: null,
+              rows: [], seen: {}, fetched: false, complete: false, capped: false, fetching: false, stopFetch: false, fetchedAt: null, reqId: 0};
     var $ = function (id) { return document.getElementById(id); };
+    function wait(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
 
     function h(tag, props, kids) {
         var e = document.createElement(tag);
@@ -152,37 +192,116 @@
             .then(function (r) { return r.json().catch(function () { return {ok: false, message: 'Unexpected server response (' + r.status + ').'}; }).then(function (j) { j._http = r.status; return j; }); });
     }
 
-    function query() {
-        var p = new URLSearchParams({page: st.page, pageSize: $('page_size').value});
-        [['search', 'f_search'], ['status', 'f_status'], ['from', 'f_from'], ['to', 'f_to']].forEach(function (x) { if ($(x[1]).value) p.set(x[0], $(x[1]).value); });
-        return p;
+    // ------------------------------------------------------------------ the fetched list (client side)
+    function byDate(a, b) { var x = a.allocationDate || '', y = b.allocationDate || ''; return x < y ? 1 : (x > y ? -1 : 0); }
+    function filteredRows() {
+        var q = $('f_search').value.trim().toLowerCase();
+        if (!q) return st.rows;
+        return st.rows.filter(function (r) { return SEARCH_FIELDS.some(function (k) { return r[k] && String(r[k]).toLowerCase().indexOf(q) !== -1; }); });
+    }
+    function refreshView() {
+        var rows = filteredRows(), size = parseInt($('page_size').value, 10) || 25;
+        var pages = Math.max(1, Math.ceil(rows.length / size));
+        st.page = Math.min(Math.max(1, st.page), pages);
+        st.data = st.fetched ? {rows: rows.slice((st.page - 1) * size, st.page * size), total: rows.length, page: st.page, pageSize: size, totalPages: pages} : null;
+        var tab = document.querySelector('#tabs button[data-m="' + st.module + '"] .count');
+        if (tab) tab.textContent = st.fetched ? '(' + st.rows.length + ')' : '';
+        render();
+    }
+    function dropRows(ids) {
+        st.rows = st.rows.filter(function (r) { return !ids[r.allocationId]; });
+        Object.keys(st.selected).forEach(function (k) { if (ids[st.selected[k].allocationId]) delete st.selected[k]; });
+        refreshView();
+    }
+    function resetView(msg) {
+        st.reqId++;                                   // any fetch still running notices this and stops
+        st.fetching = false; st.stopFetch = false; $('fetchbox').style.display = 'none';
+        st.rows = []; st.seen = {}; st.fetched = false; st.complete = false; st.capped = false; st.fetchedAt = null;
+        st.data = null; st.page = 1; st.selected = {}; $('results').innerHTML = '';
+        document.querySelectorAll('#tabs .count').forEach(function (c) { c.textContent = ''; });
+        notice(msg ? 'info' : '', msg || '');
+        render();
     }
 
-    function load(force) {
-        var id = ++st.reqId;
-        $('loading').style.display = '';
-        var p = query(); if (force) p.set('refresh', '1');
-        return api(st.module + '/list?' + p.toString()).then(function (d) {
+    // ------------------------------------------------------------------ fetch, page by page (timeout-proof)
+    // Every HTTP request asks Xero for ONE page (100 documents). A slow page is retried; a rate limit is waited out.
+    // So the size of the organisation never decides whether a request outlives the server's timeout.
+    function pageUrl(page) {
+        var p = new URLSearchParams({page: page});
+        [['status', 'f_status'], ['from', 'f_from'], ['to', 'f_to']].forEach(function (x) { if ($(x[1]).value) p.set(x[0], $(x[1]).value); });
+        return st.module + '/page?' + p.toString();
+    }
+    function setFetchText(t) { $('fx_text').textContent = t; }
+    function fetchPage(id, page, attempt, rateWaits) {
+        return api(pageUrl(page)).catch(function () { return {ok: false, errorCode: 'NETWORK_ERROR', message: 'Network error while contacting the tool.'}; })
+            .then(function (d) {
+                if (id !== st.reqId) return {cancelled: true};
+                if (d.ok === false || d.error) {
+                    var code = d.errorCode || '';
+                    if (code === 'RATE_LIMITED' && rateWaits < 30) {
+                        var secs = Math.min(Math.max(Math.ceil(d.retryAfter || 10), 2), 65);
+                        setFetchText('Xero rate limit reached — waiting ' + secs + ' s, then continuing with page ' + page + '…');
+                        return wait(secs * 1000).then(function () { return id !== st.reqId ? {cancelled: true} : fetchPage(id, page, attempt, rateWaits + 1); });
+                    }
+                    var transient = TRANSIENT.indexOf(code) !== -1 || (!code && d._http >= 500);
+                    if (transient && attempt < PAGE_RETRY_DELAYS.length) {
+                        setFetchText('Xero is slow to answer — retrying page ' + page + ' (attempt ' + (attempt + 2) + ' of ' + (PAGE_RETRY_DELAYS.length + 1) + ')…');
+                        return wait(PAGE_RETRY_DELAYS[attempt]).then(function () { return id !== st.reqId ? {cancelled: true} : fetchPage(id, page, attempt + 1, rateWaits); });
+                    }
+                    return {error: d.message || 'Could not load allocations.'};
+                }
+                return {data: d};
+            });
+    }
+
+    function fetchFromXero() {
+        if (st.busy || st.running || st.fetching) return;
+        if (!$('f_from').value || !$('f_to').value) { notice('warn', 'Choose both document dates (from and to) before fetching.'); return; }
+        if ($('f_from').value > $('f_to').value) { notice('warn', 'The "from" date is after the "to" date.'); return; }
+        resetView('');
+        var id = st.reqId, docs = 0, page = 1;
+        st.fetching = true; st.stopFetch = false;
+        $('fetchbox').style.display = ''; $('fx_stop').disabled = false; $('fx_stop').textContent = 'Stop';
+        setFetchText('Fetching page 1 from Xero…');
+        updateSel();
+
+        function finish(kind, msg) {
             if (id !== st.reqId) return;
-            $('loading').style.display = 'none';
-            if (d.ok === false || d.error) { notice('error', d.message || 'Could not load allocations.'); st.data = null; render(); return; }
-            notice('', '');
-            if (d.truncated) notice('warn', 'Only the first pages returned by Xero are shown (safety cap). Narrow the document date range to see the rest.');
-            st.data = d; st.page = d.page; render();
-            var tab = document.querySelector('#tabs button[data-m="' + st.module + '"] .count'); if (tab) tab.textContent = '(' + d.total + ')';
-        });
+            st.fetching = false; $('fetchbox').style.display = 'none'; st.fetchedAt = Date.now();
+            st.complete = kind === 'done' || kind === 'capped'; st.capped = kind === 'capped';
+            refreshView();
+            if (kind === 'capped') notice('warn', 'Safety limit reached after ' + docs + ' documents. Narrow the date range, or finish this run and fetch again for the rest.');
+            else if (kind === 'stopped') notice('warn', 'Fetch stopped. This is a partial list (' + docs + ' documents so far). Remove all stays disabled until a complete fetch finishes.');
+            else if (kind === 'error') notice('error', msg + ' ' + (st.rows.length ? 'Showing the partial list fetched so far (' + docs + ' documents); Remove all stays disabled. Click "Fetch from Xero" to try again.' : 'Click "Fetch from Xero" to try again.'));
+        }
+        (function next() {
+            if (id !== st.reqId) return;
+            if (st.stopFetch) return finish('stopped');
+            fetchPage(id, page, 0, 0).then(function (r) {
+                if (!r || r.cancelled) return;
+                if (r.error) return finish('error', r.error);
+                var d = r.data; docs += d.documents;
+                d.rows.forEach(function (row) { if (!st.seen[row.rowKey]) { st.seen[row.rowKey] = 1; st.rows.push(row); } });
+                st.rows.sort(byDate); st.fetched = true; refreshView();
+                setFetchText('Fetched ' + docs + ' documents (' + st.rows.length + ' allocations), page ' + page + (d.hasMore ? ' — continuing…' : ' — done.'));
+                if (!d.hasMore) return finish('done');
+                if (page >= d.maxPages) return finish('capped');
+                page++; next();
+            });
+        })();
     }
 
+    // ------------------------------------------------------------------ table
     function render() {
         var L = LABELS[st.module], d = st.data, body = $('rows');
         $('h_parent').textContent = L.parent; $('h_related').textContent = L.related;
         body.innerHTML = '';
         var rows = d ? d.rows : [];
-        if (!rows.length) body.appendChild(h('tr', {}, [h('td', {colspan: '9', text: d ? 'No allocations found for these filters.' : 'Nothing loaded.'})]));
+        if (!rows.length) body.appendChild(h('tr', {}, [h('td', {colspan: '9', text: d ? 'No allocations found for these filters.' : 'Nothing loaded yet. Choose the module and the date range, then click "Fetch from Xero".'})]));
         rows.forEach(function (r) {
             var cb = h('input', {type: 'checkbox'});
             cb.checked = !!st.selected[r.rowKey];
-            cb.disabled = !r.removable || st.busy || REMOVAL_BLOCKED;
+            cb.disabled = !r.removable || st.busy || st.fetching || REMOVAL_BLOCKED;
             if (r.notRemovableReason) cb.title = r.notRemovableReason;
             cb.addEventListener('change', function () { if (cb.checked) st.selected[r.rowKey] = r; else delete st.selected[r.rowKey]; updateSel(); });
             var ids = h('div', {class: 'mono'}, [
@@ -200,7 +319,7 @@
                 h('td', {text: r.relatedDocumentNumber || '—'}),
                 h('td', {}, [ids])]));
         });
-        $('page_info').textContent = d ? d.total + ' allocation(s) · page ' + d.page + ' of ' + d.totalPages : '';
+        $('page_info').textContent = d ? d.total + ' allocation(s) · page ' + d.page + ' of ' + d.totalPages + (st.fetching ? ' · still fetching…' : (st.complete ? '' : ' · partial list')) : '';
         $('btn_prev').disabled = !d || d.page <= 1; $('btn_next').disabled = !d || d.page >= d.totalPages;
         updateSel();
     }
@@ -209,12 +328,16 @@
     function updateSel() {
         var n = selectedRows().length;
         $('sel_count').textContent = n;
-        $('btn_remove').disabled = !n || st.busy || REMOVAL_BLOCKED;
+        $('btn_remove').disabled = !n || st.busy || st.fetching || REMOVAL_BLOCKED;
         $('btn_remove').textContent = n > 1 ? 'Remove Allocations' : 'Remove Allocation';
+        var total = st.complete ? filteredRows().length : 0;
+        $('btn_remove_all').textContent = 'Remove all (' + total + ')';
+        $('btn_remove_all').disabled = !total || st.busy || st.running || st.fetching || REMOVAL_BLOCKED;
         var removable = st.data ? st.data.rows.filter(function (r) { return r.removable; }) : [];
         $('sel_all').checked = removable.length > 0 && removable.every(function (r) { return st.selected[r.rowKey]; });
     }
 
+    // ------------------------------------------------------------------ remove the ticked rows
     function openModal() {
         var rows = selectedRows(), tb = $('m_rows'), L = LABELS[st.module];
         tb.innerHTML = '';
@@ -225,7 +348,7 @@
         });
         $('m_title').textContent = 'Remove ' + rows.length + ' allocation' + (rows.length > 1 ? 's' : '') + '? (' + L.parent + ')';
         $('m_ack').checked = false; $('m_ok').disabled = true;
-        if (rows.length > MAX_BULK) notice('error', 'At most ' + MAX_BULK + ' allocations can be removed at once.');
+        if (rows.length > MAX_BULK) notice('error', 'At most ' + MAX_BULK + ' allocations can be removed at once. Use "Remove all" for more.');
         $('modal').style.display = 'block'; $('m_cancel').focus();
     }
     function closeModal() { if (!st.busy) $('modal').style.display = 'none'; }
@@ -239,14 +362,18 @@
         var req = rows.length === 1
             ? api(st.module + '/remove', {body: Object.assign({confirm: true}, items[0])}).then(function (res) { return res.results ? res : {results: [res]}; })
             : api(st.module + '/remove-bulk', {body: {confirm: true, items: items}});
+        var removed = {};
         req.then(function (res) {
             var list = res.results || [{ok: false, status: 'FAILED', message: res.message || 'Request failed.', allocationId: ''}];
             showResults(list);
-            list.forEach(function (x) { if (x.ok) Object.keys(st.selected).forEach(function (k) { if (st.selected[k].allocationId === x.allocationId) delete st.selected[k]; }); });
-        }).catch(function () { showResults([{ok: false, status: 'FAILED', message: 'Network error. Nothing was confirmed; refresh and check the list.', allocationId: ''}]); })
+            list.forEach(function (x) { if (x.ok) removed[x.allocationId] = 1; });
+        }).catch(function () { showResults([{ok: false, status: 'FAILED', message: 'Network error. Nothing was confirmed; click "Fetch from Xero" and check the list.', allocationId: ''}]); })
           .then(function () {
             st.busy = false; $('m_ok').textContent = 'Remove Allocation'; $('modal').style.display = 'none';
-            load(true); loadStats();
+            // No re-fetch: the removed rows are simply taken out of the list. "Fetch from Xero" re-checks everything.
+            if (Object.keys(removed).length) { dropRows(removed); notice('info', 'Removed rows were taken out of the list. Click "Fetch from Xero" any time to re-check the current state in Xero.'); }
+            else refreshView();
+            loadStats();
         });
     }
 
@@ -264,33 +391,173 @@
         box.appendChild(h('table', {}, [h('thead', {}, [h('tr', {}, [h('th', {text: 'Result'}), h('th', {text: 'Allocation ID'}), h('th', {text: 'Details'})])]), tb]));
     }
 
+    // ------------------------------------------------------------------ Remove ALL (automatic batches)
+    function filterText() {
+        var parts = [LABELS[st.module].parent + 's'];
+        if ($('f_status').value) parts.push('status ' + $('f_status').value);
+        if ($('f_from').value) parts.push('from ' + $('f_from').value);
+        if ($('f_to').value) parts.push('to ' + $('f_to').value);
+        if ($('f_search').value) parts.push('search "' + $('f_search').value + '"');
+        return parts.join(' · ');
+    }
+
+    function openAll() {
+        if (st.busy || st.running || st.fetching || !st.complete) return;
+        var matching = filteredRows();
+        var items = matching.filter(function (r) { return r.removable; }).map(function (r) {
+            return {parentId: r.parentId, allocationId: r.allocationId, expectedAmount: r.allocationAmount, label: parentLabel(r),
+                    contact: r.contactName, related: r.relatedDocumentNumber, amount: r.allocationAmount, currency: r.currency};
+        });
+        if (!items.length) { notice('warn', 'Nothing removable matches the current filters.'); return; }
+        var d = st.all = {items: items, total: matching.length, removable: items.length, truncated: st.capped};
+        var calls = d.removable * CALLS_PER_REMOVAL, mins = Math.ceil(calls / 60);
+        $('ma_title').textContent = 'Remove ALL ' + d.removable + ' allocations?';
+        $('ma_summary').textContent = filterText() + ' — ' + d.removable + ' removable allocation(s), all pages.';
+        var extra = $('ma_extra'); extra.innerHTML = '';
+        extra.appendChild(h('div', {class: 'status info', text: 'Each removal is checked and confirmed one by one (about ' + CALLS_PER_REMOVAL +
+            ' Xero API calls each, about ' + calls + ' in total). Xero allows 60 calls per minute, so this takes at least ~' + mins + ' minute(s).'}));
+        if (calls > 4000) extra.appendChild(h('div', {class: 'status warn', text: 'This is close to Xero\'s limit of 5,000 API calls per day for one organisation. If the daily limit is reached the run stops by itself; already removed allocations stay removed, and you can run Remove all again tomorrow.'}));
+        if (d.truncated) extra.appendChild(h('div', {class: 'status warn', text: 'The fetch hit its safety limit, so this is not everything in the date range. After this run finishes, fetch again to pick up the rest.'}));
+        var age = st.fetchedAt ? Math.round((Date.now() - st.fetchedAt) / 60000) : 0;
+        if (age >= 15) extra.appendChild(h('div', {class: 'status warn', text: 'This list was fetched ' + age + ' minutes ago. If anyone else may have changed allocations since, close this and click "Fetch from Xero" first (each removal is re-checked in Xero anyway).'}));
+        var tb = $('ma_rows'); tb.innerHTML = '';
+        d.items.slice(0, 10).forEach(function (r) {
+            tb.appendChild(h('tr', {}, [h('td', {text: r.label || '—'}), h('td', {text: r.contact || '—'}), h('td', {text: r.related || '—'}),
+                h('td', {class: 'num', text: money(r.amount, r.currency)})]));
+        });
+        $('ma_more').textContent = d.removable > 10 ? '… and ' + (d.removable - 10) + ' more' : '';
+        $('ma_n').textContent = d.removable; $('ma_type').value = ''; $('ma_ack').checked = false; $('ma_ok').disabled = true;
+        $('modal_all').style.display = 'block'; $('ma_cancel').focus();
+    }
+    function closeAll() { $('modal_all').style.display = 'none'; }
+    function allReady() { return $('ma_ack').checked && st.all && $('ma_type').value.trim() === String(st.all.removable); }
+
+    function renderProgress(run, done, reason) {
+        var processed = run.ok + run.failed, pct = run.total ? Math.round(processed * 100 / run.total) : 100;
+        var secs = Math.max((Date.now() - run.started) / 1000, 1), left = processed >= 5 ? Math.ceil((run.total - processed) / (processed / secs) / 60) : null;
+        $('progress').style.display = '';
+        $('pg_title').textContent = done ? (reason ? 'Stopped.' : 'Finished.') : 'Removing allocations…';
+        $('pg_text').textContent = processed + ' / ' + run.total + ' (' + pct + '%) · removed & verified: ' + run.ok + ' · failed: ' + run.failed +
+            (!done && left !== null ? ' · about ' + left + ' min left' : '');
+        $('pg_bar').style.width = pct + '%';
+        $('pg_reason').textContent = reason || (done ? '' : (run.note || ''));
+        $('pg_hint').style.display = done ? 'none' : '';
+        $('pg_stop').style.display = done ? 'none' : ''; $('pg_stop').disabled = st.stop;
+        $('pg_stop').textContent = st.stop ? 'Stopping after this batch…' : 'Stop after current batch';
+    }
+
+    function showFailures(failures) {
+        var box = $('results'); box.innerHTML = '';
+        if (!failures.length) return;
+        var tb = h('tbody');
+        failures.slice(0, 200).forEach(function (x) {
+            tb.appendChild(h('tr', {}, [h('td', {}, [h('span', {class: 'badge ' + (x.status === 'UNVERIFIED' ? 'b-warn' : 'b-bad'), text: x.status || 'FAILED'})]),
+                h('td', {class: 'mono', text: x.allocationId || ''}), h('td', {text: x.message || ''})]));
+        });
+        box.appendChild(h('div', {class: 'status error', text: failures.length + ' allocation(s) could not be removed or confirmed (check them in Xero / fetch again):'}));
+        box.appendChild(h('table', {}, [h('thead', {}, [h('tr', {}, [h('th', {text: 'Result'}), h('th', {text: 'Allocation ID'}), h('th', {text: 'Details'})])]), tb]));
+        if (failures.length > 200) box.appendChild(h('p', {class: 'mono', text: '… and ' + (failures.length - 200) + ' more (see the audit log).'}));
+    }
+
+    function finishRun(run, reason) {
+        window.onbeforeunload = null;
+        st.running = false; st.busy = false; st.stop = false; st.all = null;
+        renderProgress(run, true, reason);
+        showFailures(run.failures);
+        dropRows(run.okIds);            // no slow re-fetch: removed rows just leave the list
+        loadStats();
+        notice('info', 'Removed rows were taken out of the list. Click "Fetch from Xero" to re-check the current state in Xero.');
+    }
+
+    function startAll() {
+        var d = st.all;
+        if (!d || st.running || !allReady()) return;
+        closeAll();
+        st.running = true; st.busy = true; st.stop = false; st.selected = {};
+        var queue = d.items.slice();
+        var run = {ok: 0, failed: 0, streak: 0, rateWaits: 0, note: '', okIds: {}, total: d.removable, failures: [], started: Date.now()};
+        $('results').innerHTML = ''; notice('', '');
+        window.onbeforeunload = function () { return 'Removal is still running.'; };
+        updateSel(); renderProgress(run, false, '');
+
+        (function step() {
+            if (st.stop) return finishRun(run, 'Stopped by you. Everything not yet processed is still in Xero.');
+            if (!queue.length) return finishRun(run, '');
+            var chunk = queue.splice(0, CHUNK), byId = {};
+            chunk.forEach(function (x) { byId[x.allocationId] = x; });
+            var body = {confirm: true, auto: true, items: chunk.map(function (x) { return {parentId: x.parentId, allocationId: x.allocationId, expectedAmount: x.expectedAmount}; })};
+            api(st.module + '/remove-bulk', {body: body}).then(function (res) {
+                if (!res.results) {
+                    return finishRun(run, 'Stopped: ' + (res.message || 'the request failed.') + ' The last batch may be partly processed; fetch again to see the real state.');
+                }
+                var requeue = [], fatal = null, pause = 0;
+                res.results.forEach(function (x) {
+                    var skipped = x.status === 'SKIPPED';
+                    if (x.ok) { run.ok++; run.streak = 0; run.okIds[x.allocationId] = 1; return; }
+                    // Not processed by Xero (time budget / rate limit): send again, after the pause Xero asked for.
+                    if (x.errorCode === 'RATE_LIMITED') { if (byId[x.allocationId]) requeue.push(byId[x.allocationId]); pause = Math.max(pause, Math.ceil(x.retryAfter || 15)); return; }
+                    if (skipped && x.errorCode === 'TIME_BUDGET') { if (byId[x.allocationId]) requeue.push(byId[x.allocationId]); return; }
+                    if (FATAL.indexOf(x.errorCode) !== -1) fatal = fatal || x;
+                    if (skipped) return;                       // never sent to Xero
+                    run.failed++; run.streak++; run.failures.push(x);
+                });
+                queue = requeue.concat(queue);
+                renderProgress(run, false, '');
+                if (fatal) return finishRun(run, 'Stopped: ' + (fatal.message || fatal.errorCode));
+                if (run.streak >= 10) return finishRun(run, 'Stopped after 10 failures in a row. Check the details below before trying again.');
+                if (pause) {
+                    if (++run.rateWaits > 60) return finishRun(run, 'Stopped: Xero keeps rate-limiting this organisation. Try again in a few minutes.');
+                    run.note = 'Xero rate limit reached — waiting ' + pause + ' s, then continuing automatically…';
+                    renderProgress(run, false, '');
+                    return wait(pause * 1000).then(function () { run.note = ''; step(); });
+                }
+                step();
+            }).catch(function () {
+                finishRun(run, 'Stopped: network error. The last batch may be partly processed; fetch again to see the real state.');
+            });
+        })();
+    }
+
     function loadStats() {
         api('status').then(function (s) { if (s.stats) $('stats').textContent = 'Verified removals: ' + s.stats.succeeded + ' · Failed: ' + s.stats.failed; });
     }
 
+    // ------------------------------------------------------------------ wiring (nothing is fetched until "Fetch from Xero")
     document.querySelectorAll('#tabs button').forEach(function (b) {
         b.addEventListener('click', function () {
-            if (st.busy) return;
+            if (st.busy || st.running) return;
             document.querySelectorAll('#tabs button').forEach(function (x) { x.classList.remove('active'); });
-            b.classList.add('active'); st.module = b.dataset.m; st.page = 1; st.selected = {}; $('results').innerHTML = ''; load(false);
+            b.classList.add('active'); st.module = b.dataset.m; resetView('');
         });
     });
-    var debounce; $('f_search').addEventListener('input', function () { clearTimeout(debounce); debounce = setTimeout(function () { st.page = 1; load(false); }, 300); });
-    ['f_status', 'f_from', 'f_to', 'page_size'].forEach(function (id) { $(id).addEventListener('change', function () { st.page = 1; load(false); }); });
-    $('btn_refresh').addEventListener('click', function () { load(true); });
-    $('btn_prev').addEventListener('click', function () { st.page -= 1; load(false); });
-    $('btn_next').addEventListener('click', function () { st.page += 1; load(false); });
+    ['f_status', 'f_from', 'f_to'].forEach(function (id) {
+        $(id).addEventListener('change', function () {
+            if (!st.busy && !st.running && (st.fetched || st.fetching)) resetView('Filters changed. Click "Fetch from Xero" to load the allocations.');
+        });
+    });
+    $('f_search').addEventListener('input', function () { if (st.fetched) { st.page = 1; refreshView(); } });
+    $('page_size').addEventListener('change', function () { st.page = 1; refreshView(); });
+    $('btn_refresh').addEventListener('click', fetchFromXero);
+    $('fx_stop').addEventListener('click', function () { st.stopFetch = true; $('fx_stop').disabled = true; $('fx_stop').textContent = 'Stopping…'; });
+    $('btn_prev').addEventListener('click', function () { st.page -= 1; refreshView(); });
+    $('btn_next').addEventListener('click', function () { st.page += 1; refreshView(); });
     $('sel_all').addEventListener('change', function (e) {
         (st.data ? st.data.rows : []).forEach(function (r) { if (r.removable) { if (e.target.checked) st.selected[r.rowKey] = r; else delete st.selected[r.rowKey]; } });
         render();
     });
     $('btn_remove').addEventListener('click', openModal);
+    $('btn_remove_all').addEventListener('click', openAll);
+    $('ma_cancel').addEventListener('click', closeAll);
+    $('ma_ack').addEventListener('change', function () { $('ma_ok').disabled = !allReady(); });
+    $('ma_type').addEventListener('input', function () { $('ma_ok').disabled = !allReady(); });
+    $('ma_ok').addEventListener('click', startAll);
+    $('pg_stop').addEventListener('click', function () { st.stop = true; $('pg_stop').disabled = true; $('pg_stop').textContent = 'Stopping after this batch…'; });
     $('m_cancel').addEventListener('click', closeModal);
     $('m_ack').addEventListener('change', function () { $('m_ok').disabled = !$('m_ack').checked || st.busy; });
     $('m_ok').addEventListener('click', confirmRemove);
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeModal(); closeAll(); } });
 
-    load(false); loadStats();
+    render(); loadStats();     // no automatic fetch: the user picks the module and date range first
     {% endif %}
 })();
 </script>
