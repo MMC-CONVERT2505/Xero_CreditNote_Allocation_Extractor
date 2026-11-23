@@ -22,13 +22,14 @@ _sleep = time.sleep  # patched in tests
 
 
 class XeroApiError(Exception):
-    def __init__(self, status, code, message, ambiguous=False, transient=False):
+    def __init__(self, status, code, message, ambiguous=False, transient=False, retry_after=None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         self.ambiguous = ambiguous
         self.transient = transient
+        self.retry_after = retry_after   # seconds Xero asked us to wait (rate limit only)
 
 
 def _extract_message(resp):
@@ -79,9 +80,12 @@ class XeroClient:
             code = "NOT_CONNECTED" if "No Xero token" in str(exc) else "TOKEN_REFRESH_FAILED"
             raise XeroApiError(401, code, "The Xero connection is not valid. Use Reset Connection, then Connect to Xero again.") from None
 
-    def request(self, method, path, tenant_id, params=None):
+    def request(self, method, path, tenant_id, params=None, rate_retries_allowed=None):
+        """rate_retries_allowed=0 -> never sleep inside the request on a 429 (used for list pages, where the browser
+        waits and retries, so one HTTP request can never outlive the web server's timeout)."""
         rejected = None
         rate_retries = 0
+        retries_allowed = self.max_rate_retries if rate_retries_allowed is None else rate_retries_allowed
         while True:
             access_token = self._access_token(rejected)
             try:
@@ -106,16 +110,19 @@ class XeroClient:
                 continue
             if status == 429:
                 daily = str(resp.headers.get("X-Rate-Limit-Problem", "")).lower() == "day"
-                if not daily and rate_retries < self.max_rate_retries:
+                try:
+                    wait = float(resp.headers.get("Retry-After", 5))
+                except (TypeError, ValueError):
+                    wait = 5
+                # Short waits are slept inline; a longer one is handed back to the caller (the browser waits), so a
+                # single HTTP request never sleeps past the web server's worker timeout.
+                if not daily and rate_retries < retries_allowed and wait <= self.max_retry_wait:
                     rate_retries += 1
-                    try:
-                        wait = float(resp.headers.get("Retry-After", 5))
-                    except (TypeError, ValueError):
-                        wait = 5
-                    _sleep(min(wait, self.max_retry_wait))
+                    _sleep(wait)
                     continue
                 raise XeroApiError(
                     429, "RATE_LIMIT_DAILY" if daily else "RATE_LIMITED",
                     "Xero daily API limit reached for this organisation." if daily
-                    else "Xero rate limit reached. Wait a minute and try again.")
+                    else "Xero rate limit reached. Wait a minute and try again.",
+                    retry_after=None if daily else wait)
             raise map_http_error(resp)

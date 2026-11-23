@@ -33,6 +33,8 @@ BLOCKED_STATUSES = {"VOIDED", "DELETED"}
 FILTER_STATUSES = ("AUTHORISED", "PAID", "VOIDED")
 PAGE_SIZE = 100          # Xero page size used while listing
 MAX_BULK = 50
+MAX_AUTO = 100           # "Remove all" sends chunks; a chunk may hold up to this many items
+AUTO_BUDGET_SECONDS = 20  # a chunk stops starting new items after this long (keeps each HTTP request short)
 # After one of these, the remaining items of a bulk request are skipped.
 FATAL_CODES = {"NOT_CONNECTED", "TOKEN_REFRESH_FAILED", "XERO_UNAUTHORIZED", "INSUFFICIENT_SCOPE", "RATE_LIMIT_DAILY", "TOKEN_STORE_ERROR"}
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -170,6 +172,7 @@ class AllocationService:
     def __init__(self, xero, max_pages=None, cache_ttl=60, clock=time.time):
         self.xero = xero
         self.max_pages = max_pages or int(os.getenv("MAX_XERO_PAGES", "25"))
+        self.fetch_max_pages = int(os.getenv("XERO_FETCH_MAX_PAGES", "200"))   # page-by-page fetch: 200 x 100 documents
         self.cache_ttl = cache_ttl
         self.clock = clock
         self._cache = {}
@@ -205,15 +208,65 @@ class AllocationService:
         return {"succeeded": ok, "failed": failed}
 
     # ---- listing
+    # The list cache lives in each gunicorn worker's memory. A removal handled by worker A can only clear A's cache,
+    # so worker B kept serving the old list (the "count jumped back after reload" symptom). The epoch file is the
+    # shared signal: every removal stamps it, and any cache entry older than the stamp is ignored by every worker.
+    @staticmethod
+    def _epoch_path():
+        return os.getenv("ALLOCATION_CACHE_EPOCH_FILE") or "allocation_cache_epoch"
+
+    def _bump_epoch(self):
+        try:
+            with open(self._epoch_path(), "w", encoding="utf-8") as fh:
+                fh.write(repr(self.clock()))
+        except OSError:
+            pass  # worst case: the 60 s TTL still applies
+
+    def _epoch(self):
+        try:
+            with open(self._epoch_path(), "r", encoding="utf-8") as fh:
+                return float(fh.read().strip())
+        except (OSError, ValueError):
+            return 0.0
+
     def invalidate(self, tenant_id):
         for key in [k for k in self._cache if k[0] == tenant_id]:
             self._cache.pop(key, None)
+        self._bump_epoch()
+
+    @staticmethod
+    def _rows_from_items(module_key, mod, items):
+        rows = []
+        for parent in items:
+            if mod["type"] and parent.get("Type") != mod["type"]:
+                continue  # never rely on the server-side filter alone for the module split
+            for i, alloc in enumerate(parent.get("Allocations") or []):
+                if not alloc.get("IsDeleted"):
+                    rows.append(normalize_row(module_key, parent, alloc, i))
+        return rows
+
+    def fetch_page(self, ctx, module_key, f, page):
+        """ONE Xero list call per HTTP request. The browser walks the pages itself (with retries and a progress bar),
+        so no request can outlive gunicorn/nginx timeouts however large the organisation is. Stateless on purpose:
+        nothing is cached on the server, so every worker answers the same."""
+        mod = MODULES[module_key]
+        if not 1 <= page <= self.fetch_max_pages:
+            raise XeroApiError(400, "PAGE_OUT_OF_RANGE", f"page must be between 1 and {self.fetch_max_pages}.")
+        params = {"page": page, "pageSize": PAGE_SIZE}
+        where = build_where(mod, f)
+        if where:
+            params["where"] = where
+        # rate_retries_allowed=0: on a 429 answer immediately with retryAfter instead of sleeping inside the request
+        data = self.xero.request("GET", f"/{mod['resource']}", ctx["tenant_id"], params=params, rate_retries_allowed=0) or {}
+        items = data.get(mod["resource"]) or []
+        return {"rows": self._rows_from_items(module_key, mod, items), "page": page, "documents": len(items),
+                "hasMore": len(items) >= PAGE_SIZE, "maxPages": self.fetch_max_pages}
 
     def list_rows(self, ctx, module_key, f):
         mod = MODULES[module_key]
         key = (ctx["tenant_id"], module_key, f["status"], f["from"], f["to"])
         hit = self._cache.get(key)
-        if hit and not f["refresh"] and self.clock() - hit["at"] < self.cache_ttl:
+        if hit and not f["refresh"] and self.clock() - hit["at"] < self.cache_ttl and hit["at"] > self._epoch():
             return hit
         where = build_where(mod, f)
         rows, truncated = [], False
@@ -223,12 +276,7 @@ class AllocationService:
                 params["where"] = where
             data = self.xero.request("GET", f"/{mod['resource']}", ctx["tenant_id"], params=params) or {}
             items = data.get(mod["resource"]) or []
-            for parent in items:
-                if mod["type"] and parent.get("Type") != mod["type"]:
-                    continue  # never rely on the server-side filter alone for the module split
-                for i, alloc in enumerate(parent.get("Allocations") or []):
-                    if not alloc.get("IsDeleted"):
-                        rows.append(normalize_row(module_key, parent, alloc, i))
+            rows.extend(self._rows_from_items(module_key, mod, items))
             if len(items) < PAGE_SIZE:
                 break
             if page == self.max_pages:
@@ -239,7 +287,7 @@ class AllocationService:
         return entry
 
     @staticmethod
-    def query_rows(entry, f):
+    def filter_rows(entry, f):
         q = f["search"].lower()
         rows = entry["rows"]
         if q:
@@ -247,6 +295,21 @@ class AllocationService:
                 return any(q in str(r[k]).lower() for k in
                            ("parentNumber", "reference", "contactName", "relatedDocumentNumber", "parentId", "allocationId") if r.get(k))
             rows = [r for r in rows if hit(r)]
+        return rows
+
+    def targets(self, entry, f):
+        """Every removable allocation matching the filters (all pages) - the work list for 'Remove all'."""
+        rows = self.filter_rows(entry, f)
+        items = [{"parentId": r["parentId"], "allocationId": r["allocationId"], "expectedAmount": r["allocationAmount"],
+                  "label": r["parentNumber"] or r["reference"] or r["parentId"], "contact": r["contactName"],
+                  "related": r["relatedDocumentNumber"], "amount": r["allocationAmount"], "currency": r["currency"]}
+                 for r in rows if r["removable"]]
+        return {"items": items, "total": len(rows), "removable": len(items), "truncated": entry["truncated"],
+                "fetchedAt": datetime.fromtimestamp(entry["at"], tz=timezone.utc).isoformat()}
+
+    @classmethod
+    def query_rows(cls, entry, f):
+        rows = cls.filter_rows(entry, f)
         total = len(rows)
         pages = max(1, -(-total // f["pageSize"]))
         page = min(f["page"], pages)
@@ -346,6 +409,8 @@ class AllocationService:
         def fail(exc):
             out.update(status="UNVERIFIED" if exc.code in ("VERIFICATION_FAILED", "OUTCOME_UNKNOWN") else "FAILED",
                        errorCode=exc.code, message=exc.message, httpStatus=exc.status)
+            if getattr(exc, "retry_after", None):
+                out["retryAfter"] = exc.retry_after
             return out
 
         if not is_uuid(parent_id):
@@ -376,12 +441,15 @@ class AllocationService:
                     "status": out.get("status"), "errorCode": out.get("errorCode")})
         return out
 
-    def remove_bulk(self, ctx, module_key, items):
+    def remove_bulk(self, ctx, module_key, items, budget=None, max_items=MAX_BULK):
+        """budget (seconds): once exceeded, the remaining items are returned as SKIPPED/TIME_BUDGET (nothing was sent
+        to Xero for them) so the caller can send them again in the next request."""
         if not isinstance(items, list) or not items:
             raise XeroApiError(400, "NO_ITEMS", "Select at least one allocation.")
-        if len(items) > MAX_BULK:
-            raise XeroApiError(400, "TOO_MANY_ITEMS", f"At most {MAX_BULK} allocations per request.")
-        results, seen, aborted = [], set(), None
+        if len(items) > max_items:
+            raise XeroApiError(400, "TOO_MANY_ITEMS", f"At most {max_items} allocations per request.")
+        results, seen, aborted, abort_retry = [], set(), None, None
+        started = self.clock()
 
         def skipped(item, code, message):
             item = item if isinstance(item, dict) else {}
@@ -391,29 +459,49 @@ class AllocationService:
         for item in items:
             alloc_id = str((item or {}).get("allocationId") or "").lower() if isinstance(item, dict) else ""
             if aborted:
-                results.append(skipped(item, aborted, "Skipped because an earlier item hit a connection or limit error."))
+                res = skipped(item, aborted, "Skipped because an earlier item hit a connection or limit error.")
+                if abort_retry:
+                    res["retryAfter"] = abort_retry
+                results.append(res)
                 continue
             if alloc_id and alloc_id in seen:
                 results.append(skipped(item, "DUPLICATE_IN_REQUEST", "Duplicate allocation in this request."))
+                continue
+            if budget is not None and results and self.clock() - started >= budget:
+                results.append(skipped(item, "TIME_BUDGET", "Not started yet (request time budget reached). Send again."))
                 continue
             if alloc_id:
                 seen.add(alloc_id)
             res = self.remove(ctx, module_key, item)
             results.append(res)
-            if not res["ok"] and res.get("errorCode") in FATAL_CODES:
-                aborted = res["errorCode"]
+            if not res["ok"] and (res.get("errorCode") in FATAL_CODES or res.get("errorCode") == "RATE_LIMITED"):
+                aborted, abort_retry = res["errorCode"], res.get("retryAfter")   # RATE_LIMITED: stop the chunk; nothing was processed, the caller waits and resends
         ok = sum(1 for r in results if r["ok"])
         skip = sum(1 for r in results if r.get("status") == "SKIPPED")
         return {"results": results, "summary": {"total": len(results), "succeeded": ok, "failed": len(results) - ok - skip, "skipped": skip}}
 
 
 # ------------------------------------------------------------------------------------------- blueprint
-def _err(status, code, message):
-    return jsonify({"ok": False, "errorCode": code, "message": message}), status
+def _err(status, code, message, retry_after=None):
+    body = {"ok": False, "errorCode": code, "message": message}
+    if retry_after:
+        body["retryAfter"] = retry_after
+    return jsonify(body), status
 
 
 def register(app, *, get_valid_token, force_refresh, get_tenant_info):
-    service = AllocationService(XeroClient(get_valid_token, force_refresh))
+    try:
+        ttl = int(os.getenv("ALLOCATION_LIST_CACHE_SECONDS", "600"))
+    except ValueError:
+        ttl = 600
+    # Paging / searching a fetched list is served from memory; a removal clears it (see _bump_epoch).
+    try:
+        inline_wait = float(os.getenv("XERO_MAX_INLINE_WAIT", "20"))
+    except ValueError:
+        inline_wait = 20.0
+    # A rate-limit wait longer than this is not slept inside the HTTP request (it would risk the worker timeout);
+    # the browser waits and resends instead.
+    service = AllocationService(XeroClient(get_valid_token, force_refresh, max_retry_wait=inline_wait), cache_ttl=ttl)
     app.extensions["allocation_removal"] = service
     bp = Blueprint("allocations", __name__, url_prefix="/allocations")
 
@@ -427,7 +515,7 @@ def register(app, *, get_valid_token, force_refresh, get_tenant_info):
 
     @bp.errorhandler(XeroApiError)
     def handle_api_error(exc):
-        return _err(exc.status, exc.code, exc.message)
+        return _err(exc.status, exc.code, exc.message, retry_after=exc.retry_after)
 
     def csrf_token():
         token = session.get("csrf_token")
@@ -493,9 +581,27 @@ def register(app, *, get_valid_token, force_refresh, get_tenant_info):
         result = service.remove(ctx, module, body)
         return jsonify(result), 200 if result["ok"] else result.get("httpStatus", 500)
 
+    @bp.get("/api/<module>/page")
+    def fetch_one_page(module):
+        """Read-only: one page of Xero documents, already split into allocation rows. The browser loops over pages."""
+        module_or_404(module)
+        ctx = context()
+        f = parse_list_query(request.args)
+        return jsonify(service.fetch_page(ctx, module, f, f["page"]))
+
+    @bp.get("/api/<module>/targets")
+    def list_targets(module):
+        """Read-only: the complete work list for 'Remove all' (every removable row matching the filters)."""
+        module_or_404(module)
+        ctx = context()
+        f = parse_list_query(request.args)
+        return jsonify(service.targets(service.list_rows(ctx, module, f), f))
+
     @bp.post("/api/<module>/remove-bulk")
     def remove_many(module):
         body, ctx = write_guard(module)
+        if body.get("auto") is True:  # one chunk of a "Remove all" run: bigger, but time-boxed
+            return jsonify(service.remove_bulk(ctx, module, body.get("items"), budget=AUTO_BUDGET_SECONDS, max_items=MAX_AUTO))
         return jsonify(service.remove_bulk(ctx, module, body.get("items")))
 
     app.register_blueprint(bp)
