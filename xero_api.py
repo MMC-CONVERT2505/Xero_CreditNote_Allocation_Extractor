@@ -8,6 +8,8 @@ Only `requests` (already a dependency) is used. The existing fetch code in app.p
           a daily limit is not retried
 * timeouts / connection errors / 5xx -> raised with ambiguous=True: the caller must re-check the real state
   before any retry of a write
+* every response: Xero's X-DayLimit-Remaining / X-MinLimit-Remaining headers are remembered per organisation
+  (XeroClient.limits_for) so the UI can show the remaining daily budget and a run can stop cleanly before it hits zero
 * every other 4xx -> a readable message taken from Xero's own validation text
 Error messages never contain tokens, headers or request bodies.
 """
@@ -69,6 +71,32 @@ class XeroClient:
         self.timeout = timeout
         self.max_rate_retries = max_rate_retries
         self.max_retry_wait = max_retry_wait
+        self._limits = {}   # tenant_id -> {"day": int|None, "minute": int|None, "at": epoch seconds}
+        self.clock = time.time
+
+    @staticmethod
+    def _header_int(resp, name):
+        try:
+            return int(str(resp.headers.get(name, "")).strip())
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _note_limits(self, tenant_id, resp, day_exhausted=False):
+        """Remember the last remaining-call counts Xero reported (per organisation, per process)."""
+        day = 0 if day_exhausted else self._header_int(resp, "X-DayLimit-Remaining")
+        minute = self._header_int(resp, "X-MinLimit-Remaining")
+        if day is None and minute is None:
+            return
+        old = self._limits.get(tenant_id) or {}
+        self._limits[tenant_id] = {"day": day if day is not None else old.get("day"),
+                                   "minute": minute if minute is not None else old.get("minute"), "at": self.clock()}
+
+    def limits_for(self, tenant_id, max_age=None):
+        """Last known remaining calls, or None. max_age (seconds) ignores a reading that is too old to trust."""
+        info = self._limits.get(tenant_id)
+        if not info or (max_age is not None and self.clock() - info["at"] > max_age):
+            return None
+        return dict(info)
 
     def _access_token(self, rejected=None):
         try:
@@ -100,6 +128,7 @@ class XeroClient:
                 raise XeroApiError(502, "NETWORK_ERROR", "Could not reach Xero.", ambiguous=True, transient=True) from None
 
             status = resp.status_code
+            self._note_limits(tenant_id, resp)
             if 200 <= status < 300:
                 try:
                     return resp.json()
@@ -110,6 +139,8 @@ class XeroClient:
                 continue
             if status == 429:
                 daily = str(resp.headers.get("X-Rate-Limit-Problem", "")).lower() == "day"
+                if daily:
+                    self._note_limits(tenant_id, resp, day_exhausted=True)
                 try:
                     wait = float(resp.headers.get("Retry-After", 5))
                 except (TypeError, ValueError):

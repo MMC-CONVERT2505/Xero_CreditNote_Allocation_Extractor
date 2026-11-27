@@ -72,16 +72,15 @@ class RemoveAllTests(RemovalTestCase):
     def test_time_budget_defers_the_rest_without_touching_xero_and_a_resend_finishes_them(self):
         self.add_allocations(3)
         clock = {"t": 1000.0}
-        real_remove = self.service.remove
+        real_delete = self.service._delete_one
 
-        def slow_remove(ctx, module, item):
-            result = real_remove(ctx, module, item)
+        def slow_delete(*args, **kwargs):
+            real_delete(*args, **kwargs)
             clock["t"] += 15
-            return result
 
         items = [self.item(extra_id(n)) for n in (1, 2, 3)]
         with mock.patch.object(self.service, "clock", new=lambda: clock["t"]), \
-                mock.patch.object(self.service, "remove", side_effect=slow_remove):
+                mock.patch.object(self.service, "_delete_one", side_effect=slow_delete):
             first = self.service.remove_bulk(CTX, CN, items, budget=20)
             self.assertEqual([r["status"] for r in first["results"]], ["REMOVED_VERIFIED", "REMOVED_VERIFIED", "SKIPPED"])
             self.assertEqual(first["results"][2]["errorCode"], "TIME_BUDGET")
@@ -214,3 +213,192 @@ class PageFetchTests(RemovalTestCase):
         again = self.post(CN, "remove-bulk", {"confirm": True, "auto": True, "items": [
             {"parentId": IDS["cn1"], "allocationId": IDS["a1"]}]}).get_json()
         self.assertEqual(again["summary"]["succeeded"], 1)   # sending the same item again afterwards works
+
+
+def parent_reads(xero):
+    return [c for c in xero.calls if c["method"] == "GET" and c["path"].count("/") == 2]
+
+
+class GroupedRemovalTests(RemovalTestCase):
+    """Allocations of one document are removed with 1 pre-flight + N DELETEs + 1 verification (N + 2 calls)."""
+
+    def add_allocations(self, count):
+        for n in range(1, count + 1):
+            self.xero.credit_notes[0]["Allocations"].append(alloc(extra_id(n), 10, f"INV-X{n}"))
+
+    def item(self, alloc_id, parent="cn1", **extra):
+        return {"parentId": IDS[parent], "allocationId": alloc_id, **extra}
+
+    def test_five_allocations_of_one_document_cost_seven_calls_not_fifteen(self):
+        self.add_allocations(3)                                           # cn1 now holds a1, a4 + 3 extras
+        items = [self.item(IDS["a1"]), self.item(IDS["a4"])] + [self.item(extra_id(n)) for n in (1, 2, 3)]
+        res = self.service.remove_bulk(CTX, CN, items)
+        self.assertEqual(res["summary"]["succeeded"], 5)
+        self.assertEqual(len(parent_reads(self.xero)), 2, "one pre-flight and one verification for the whole document")
+        self.assertEqual(len(self.xero.allocation_deletes()), 5, "every allocation is still its own DELETE")
+        self.assertEqual(self.xero.credit_notes[0]["Allocations"], [])
+        for r in res["results"]:
+            self.assertEqual((r["ok"], r["status"]), (True, "REMOVED_VERIFIED"))
+            self.assertEqual(r["verification"]["allocationPresentAfter"], False)
+            self.assertEqual(r["parentNumber"], "CN-001")
+
+    def test_a_single_allocation_still_costs_three_calls(self):
+        res = self.service.remove_bulk(CTX, CN, [self.item(IDS["a1"])])
+        self.assertEqual(res["summary"]["succeeded"], 1)
+        self.assertEqual(len(parent_reads(self.xero)), 2)
+        self.assertEqual(len(self.xero.allocation_deletes()), 1)
+
+    def test_results_keep_the_request_order_when_documents_are_interleaved(self):
+        items = [self.item(IDS["a1"]), self.item(IDS["a2"], "cn2"), self.item(IDS["a4"])]
+        res = self.service.remove_bulk(CTX, CN, items)["results"]
+        self.assertEqual([r["allocationId"] for r in res], [IDS["a1"], IDS["a2"], IDS["a4"]])
+        # cn2 is a bill credit, so it is refused in the Credit Note module - the two cn1 allocations are unaffected
+        self.assertEqual([r["status"] for r in res], ["REMOVED_VERIFIED", "FAILED", "REMOVED_VERIFIED"])
+        self.assertEqual(res[1]["errorCode"], "WRONG_MODULE")
+
+    def test_a_stale_amount_only_fails_that_allocation(self):
+        items = [self.item(IDS["a1"], expectedAmount=999), self.item(IDS["a4"], expectedAmount=50)]
+        res = self.service.remove_bulk(CTX, CN, items)["results"]
+        self.assertEqual((res[0]["status"], res[0]["errorCode"]), ("FAILED", "STALE_DATA"))
+        self.assertTrue(res[1]["ok"])
+        self.assertEqual([c["path"].split("/")[-1] for c in self.xero.allocation_deletes()], [IDS["a4"]])
+
+    def test_missing_allocation_in_a_group_is_reported_and_the_rest_continue(self):
+        items = [self.item(IDS["a1"]), self.item(extra_id(9)), self.item(IDS["a4"])]
+        res = self.service.remove_bulk(CTX, CN, items)["results"]
+        self.assertEqual([r["ok"] for r in res], [True, False, True])
+        self.assertEqual(res[1]["errorCode"], "ALLOCATION_NOT_FOUND")
+
+    def test_group_where_xero_ignores_the_delete_is_never_reported_as_removed(self):
+        self.xero.ignore_delete = True
+        res = self.service.remove_bulk(CTX, CN, [self.item(IDS["a1"]), self.item(IDS["a4"])])["results"]
+        for r in res:
+            self.assertEqual((r["ok"], r["status"], r["errorCode"]), (False, "UNVERIFIED", "VERIFICATION_FAILED"))
+
+    def test_failed_verification_fetch_marks_the_group_unverified(self):
+        reads = {"n": 0}
+
+        def second_read(call):
+            if call["method"] == "GET" and call["path"] == f"/CreditNotes/{IDS['cn1']}":
+                reads["n"] += 1
+                return reads["n"] == 2
+            return False
+        self.xero.fail(second_read, response=FakeResponse(500, {}))
+        res = self.service.remove_bulk(CTX, CN, [self.item(IDS["a1"]), self.item(IDS["a4"])])["results"]
+        self.assertEqual([r["status"] for r in res], ["UNVERIFIED", "UNVERIFIED"])
+        self.assertEqual(len(self.xero.allocation_deletes()), 2)
+
+    def test_rate_limit_in_the_middle_of_a_group_stops_it_and_verifies_what_was_done(self):
+        self.add_allocations(1)
+        self.xero.fail(lambda c: c["method"] == "DELETE" and c["path"].endswith(IDS["a4"]),
+                       response=FakeResponse(429, {}, headers={"Retry-After": "100"}))
+        items = [self.item(IDS["a1"]), self.item(IDS["a4"]), self.item(extra_id(1))]
+        res = self.service.remove_bulk(CTX, CN, items)["results"]
+        self.assertEqual(res[0]["status"], "REMOVED_VERIFIED")
+        self.assertEqual((res[1]["status"], res[1]["errorCode"], res[1]["retryAfter"]), ("FAILED", "RATE_LIMITED", 100.0))
+        self.assertEqual((res[2]["status"], res[2]["errorCode"], res[2]["retryAfter"]), ("SKIPPED", "RATE_LIMITED", 100.0))
+        self.assertEqual(len(self.xero.allocation_deletes()), 2, "nothing is sent after the limit was hit")
+        self.assertEqual(len(parent_reads(self.xero)), 2, "the allocation that was removed is still verified")
+
+    def test_time_budget_inside_a_group_defers_the_rest_and_still_verifies_once(self):
+        self.add_allocations(2)
+        clock = {"t": 0.0}
+        real = self.service._delete_one
+
+        def slow(*a, **k):
+            real(*a, **k)
+            clock["t"] += 15
+        items = [self.item(IDS["a1"]), self.item(IDS["a4"]), self.item(extra_id(1)), self.item(extra_id(2))]
+        with mock.patch.object(self.service, "clock", new=lambda: clock["t"]), mock.patch.object(self.service, "_delete_one", side_effect=slow):
+            res = self.service.remove_bulk(CTX, CN, items, budget=20)["results"]
+        self.assertEqual([r["status"] for r in res], ["REMOVED_VERIFIED", "REMOVED_VERIFIED", "SKIPPED", "SKIPPED"])
+        self.assertEqual({r["errorCode"] for r in res[2:]}, {"TIME_BUDGET"})
+        self.assertEqual(len(self.xero.allocation_deletes()), 2)
+        self.assertEqual(len(parent_reads(self.xero)), 2)
+
+    def test_fatal_error_during_the_pre_flight_reports_once_and_skips_the_rest(self):
+        self.xero.fail(lambda c: c["method"] == "GET" and c["path"] == f"/CreditNotes/{IDS['cn1']}", response=FakeResponse(403, {}))
+        res = self.service.remove_bulk(CTX, CN, [self.item(IDS["a1"]), self.item(IDS["a4"])])["results"]
+        self.assertEqual((res[0]["status"], res[0]["errorCode"]), ("FAILED", "INSUFFICIENT_SCOPE"))
+        self.assertEqual((res[1]["status"], res[1]["errorCode"]), ("SKIPPED", "INSUFFICIENT_SCOPE"))
+        self.assertEqual(self.xero.allocation_deletes(), [])
+
+    def test_a_voided_document_fails_every_allocation_without_any_delete(self):
+        res = self.service.remove_bulk(CTX, CN, [self.item(IDS["a5"], "cn3")])["results"]
+        self.assertEqual(res[0]["errorCode"], "UNSUPPORTED_STATUS")
+        self.assertEqual(self.xero.allocation_deletes(), [])
+
+    def test_audit_log_gets_one_entry_per_allocation(self):
+        self.service.remove_bulk(CTX, CN, [self.item(IDS["a1"]), self.item(IDS["a4"])])
+        with open(self.service._audit_path(), encoding="utf-8") as fh:
+            lines = [l for l in fh if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("AT-secret", "".join(lines))
+
+
+class CallBudgetTests(RemovalTestCase):
+    def reading(self, day, age=0):
+        client = self.service.xero
+        client._limits["tenant-1"] = {"day": day, "minute": 50, "at": client.clock() - age}
+
+    def test_remaining_calls_are_read_from_xeros_headers_and_returned_to_the_browser(self):
+        self.xero.fail(lambda c: c["path"] == "/CreditNotes",
+                       response=FakeResponse(200, {"CreditNotes": []}, headers={"X-DayLimit-Remaining": "4321", "X-MinLimit-Remaining": "55"}))
+        body = self.client.get("/allocations/api/credit_note/page?page=1").get_json()
+        self.assertEqual((body["limits"]["dayRemaining"], body["limits"]["minuteRemaining"]), (4321, 55))
+        self.assertEqual(body["limits"]["reserve"], 50)
+
+    def test_missing_headers_mean_unknown_not_zero(self):
+        body = self.client.get("/allocations/api/credit_note/page?page=1").get_json()
+        self.assertIsNone(body["limits"])
+
+    def test_a_daily_429_is_remembered_as_zero_calls_left(self):
+        self.xero.fail(lambda c: c["path"] == "/CreditNotes",
+                       response=FakeResponse(429, {}, headers={"X-Rate-Limit-Problem": "day", "Retry-After": "3600"}))
+        r = self.client.get("/allocations/api/credit_note/page?page=1")
+        self.assertEqual(r.get_json()["errorCode"], "RATE_LIMIT_DAILY")
+        self.assertEqual(self.service.xero.limits_for("tenant-1")["day"], 0)
+
+    def test_run_stops_cleanly_before_the_daily_limit_without_calling_xero(self):
+        self.reading(day=10)
+        single = self.service.remove(CTX, CN, {"parentId": IDS["cn1"], "allocationId": IDS["a1"]})
+        self.assertEqual((single["status"], single["errorCode"]), ("FAILED", "DAILY_BUDGET_LOW"))
+        bulk = self.service.remove_bulk(CTX, CN, [{"parentId": IDS["cn1"], "allocationId": IDS["a1"]}, {"parentId": IDS["cn1"], "allocationId": IDS["a4"]},
+                                                  {"parentId": IDS["cn2"], "allocationId": IDS["a2"]}])
+        self.assertEqual([r["errorCode"] for r in bulk["results"]], ["DAILY_BUDGET_LOW"] * 3)
+        self.assertEqual([r["status"] for r in bulk["results"]], ["FAILED", "SKIPPED", "SKIPPED"])
+        self.assertEqual(self.xero.calls, [], "nothing at all was sent to Xero")
+
+    def test_enough_budget_lets_the_run_proceed(self):
+        self.reading(day=5000)
+        self.assertTrue(self.service.remove(CTX, CN, {"parentId": IDS["cn1"], "allocationId": IDS["a1"]})["ok"])
+
+    def test_a_stale_low_reading_never_blocks_the_tool_for_good(self):
+        self.reading(day=0, age=3600)
+        self.assertTrue(self.service.remove(CTX, CN, {"parentId": IDS["cn1"], "allocationId": IDS["a1"]})["ok"])
+
+    def test_the_reserve_can_be_configured(self):
+        self.reading(day=30)
+        self.service.daily_reserve = 20
+        self.assertTrue(self.service.remove(CTX, CN, {"parentId": IDS["cn1"], "allocationId": IDS["a1"]})["ok"])
+
+    def test_group_stops_in_the_middle_when_the_budget_runs_low_and_still_verifies(self):
+        for n in (1, 2):
+            self.xero.credit_notes[0]["Allocations"].append(alloc(extra_id(n), 10, f"INV-X{n}"))
+        real = self.service._delete_one
+
+        def delete_then_drop_budget(*a, **k):
+            real(*a, **k)
+            self.reading(day=5)          # Xero now reports almost nothing left
+        items = [{"parentId": IDS["cn1"], "allocationId": x} for x in (IDS["a1"], IDS["a4"], extra_id(1))]
+        with mock.patch.object(self.service, "_delete_one", side_effect=delete_then_drop_budget):
+            res = self.service.remove_bulk(CTX, CN, items)["results"]
+        self.assertEqual([r["status"] for r in res], ["REMOVED_VERIFIED", "FAILED", "SKIPPED"])
+        self.assertEqual(res[1]["errorCode"], "DAILY_BUDGET_LOW")
+        self.assertEqual(len(self.xero.allocation_deletes()), 1)
+
+    def test_status_and_bulk_responses_carry_the_limits(self):
+        self.reading(day=4000)
+        self.assertEqual(self.client.get("/allocations/api/status").get_json()["limits"]["dayRemaining"], 4000)
+        body = self.post(CN, "remove-bulk", {"confirm": True, "items": [{"parentId": IDS["cn1"], "allocationId": IDS["a1"]}]}).get_json()
+        self.assertIn("limits", body)

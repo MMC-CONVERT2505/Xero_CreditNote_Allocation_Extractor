@@ -36,7 +36,10 @@ MAX_BULK = 50
 MAX_AUTO = 100           # "Remove all" sends chunks; a chunk may hold up to this many items
 AUTO_BUDGET_SECONDS = 20  # a chunk stops starting new items after this long (keeps each HTTP request short)
 # After one of these, the remaining items of a bulk request are skipped.
-FATAL_CODES = {"NOT_CONNECTED", "TOKEN_REFRESH_FAILED", "XERO_UNAUTHORIZED", "INSUFFICIENT_SCOPE", "RATE_LIMIT_DAILY", "TOKEN_STORE_ERROR"}
+FATAL_CODES = {"NOT_CONNECTED", "TOKEN_REFRESH_FAILED", "XERO_UNAUTHORIZED", "INSUFFICIENT_SCOPE", "RATE_LIMIT_DAILY", "TOKEN_STORE_ERROR",
+               "DAILY_BUDGET_LOW"}
+DAILY_RESERVE_DEFAULT = 50   # stop on purpose when Xero says this few calls are left for the day (env XERO_DAILY_RESERVE)
+LIMIT_MAX_AGE = 900          # a "calls left" reading older than this (seconds) is not trusted for stopping a run
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 LEGACY_SECRET_KEY = "fixed_secret_key_2024"
 
@@ -173,6 +176,10 @@ class AllocationService:
         self.xero = xero
         self.max_pages = max_pages or int(os.getenv("MAX_XERO_PAGES", "25"))
         self.fetch_max_pages = int(os.getenv("XERO_FETCH_MAX_PAGES", "200"))   # page-by-page fetch: 200 x 100 documents
+        try:
+            self.daily_reserve = max(0, int(os.getenv("XERO_DAILY_RESERVE", str(DAILY_RESERVE_DEFAULT))))
+        except ValueError:
+            self.daily_reserve = DAILY_RESERVE_DEFAULT
         self.cache_ttl = cache_ttl
         self.clock = clock
         self._cache = {}
@@ -245,6 +252,26 @@ class AllocationService:
                     rows.append(normalize_row(module_key, parent, alloc, i))
         return rows
 
+    # ---- Xero call budget (read from Xero's own response headers; nothing is guessed)
+    def limits(self, ctx):
+        """Last known remaining calls for this organisation, as the UI wants them; None if Xero has not told us yet."""
+        getter = getattr(self.xero, "limits_for", None)
+        info = getter(ctx["tenant_id"]) if getter else None
+        if not info:
+            return None
+        return {"dayRemaining": info.get("day"), "minuteRemaining": info.get("minute"), "reserve": self.daily_reserve}
+
+    def _guard_budget(self, ctx):
+        """Stop cleanly BEFORE the daily limit instead of failing halfway. Only a recent reading counts, so a stale low
+        value can never block the tool for good (after LIMIT_MAX_AGE one call is let through and refreshes it)."""
+        getter = getattr(self.xero, "limits_for", None)
+        info = getter(ctx["tenant_id"], LIMIT_MAX_AGE) if getter else None
+        day = (info or {}).get("day")
+        if day is not None and day <= self.daily_reserve:
+            raise XeroApiError(429, "DAILY_BUDGET_LOW",
+                               f"Stopped on purpose: Xero reports only {day} API calls left today for this organisation "
+                               f"(reserve {self.daily_reserve}). Nothing was lost. Continue after the daily limit resets.")
+
     def fetch_page(self, ctx, module_key, f, page):
         """ONE Xero list call per HTTP request. The browser walks the pages itself (with retries and a progress bar),
         so no request can outlive gunicorn/nginx timeouts however large the organisation is. Stateless on purpose:
@@ -260,7 +287,7 @@ class AllocationService:
         data = self.xero.request("GET", f"/{mod['resource']}", ctx["tenant_id"], params=params, rate_retries_allowed=0) or {}
         items = data.get(mod["resource"]) or []
         return {"rows": self._rows_from_items(module_key, mod, items), "page": page, "documents": len(items),
-                "hasMore": len(items) >= PAGE_SIZE, "maxPages": self.fetch_max_pages}
+                "hasMore": len(items) >= PAGE_SIZE, "maxPages": self.fetch_max_pages, "limits": self.limits(ctx)}
 
     def list_rows(self, ctx, module_key, f):
         mod = MODULES[module_key]
@@ -343,18 +370,15 @@ class AllocationService:
         a = ((resp or {}).get("Allocations") or [None])[0] or (resp or {}).get("Allocation") or resp or {}
         return {"isDeleted": a.get("IsDeleted"), "amount": a.get("Amount")}
 
-    def _do_remove(self, ctx, mod, payload, out):
-        parent_id, allocation_id = payload["parentId"], payload["allocationId"]
-        # 1. Pre-flight
-        parent = self._fetch_parent(ctx, mod, parent_id)
-        out["parentNumber"] = parent.get("CreditNoteNumber")
-        out["contactName"] = (parent.get("Contact") or {}).get("Name")
+    def _check_parent(self, mod, parent):
         if mod["type"] and parent.get("Type") != mod["type"]:
             other = "Bill Credit" if parent.get("Type") == "ACCPAYCREDIT" else "Credit Note"
             raise XeroApiError(422, "WRONG_MODULE", f"This document is of type {parent.get('Type')}. Use the {other} module instead.")
         if parent.get("Status") in BLOCKED_STATUSES:
             raise XeroApiError(422, "UNSUPPORTED_STATUS", f"Allocations cannot be removed while the document status is {parent.get('Status')}.")
-        alloc = self._find_allocation(parent, allocation_id)
+
+    def _check_allocation(self, parent, payload, out):
+        alloc = self._find_allocation(parent, payload["allocationId"])
         if alloc is None:
             raise XeroApiError(404, "ALLOCATION_NOT_FOUND", "Allocation not found on this document. It may already have been removed. No request was sent to Xero.")
         out["amount"] = allocation_amount(alloc)
@@ -367,14 +391,15 @@ class AllocationService:
             if changed:
                 raise XeroApiError(409, "STALE_DATA", f"The allocation amount in Xero ({out['amount']}) differs from what you selected ({expected}). Refresh and review again.")
 
-        # 2. DELETE - the allocation endpoint only
+    def _delete_one(self, ctx, mod, parent_id, allocation_id, out):
+        """The DELETE itself (allocation endpoint only). An unclear outcome is checked against the real state first."""
         path = f"/{mod['resource']}/{parent_id}/Allocations/{allocation_id}"
         attempt = 0
         while True:
             attempt += 1
             try:
                 out["xeroResponse"] = self._summarize(self.xero.request("DELETE", path, ctx["tenant_id"]))
-                break
+                return
             except XeroApiError as exc:
                 if not exc.ambiguous:
                     raise  # definite rejection: Xero changed nothing
@@ -385,100 +410,264 @@ class AllocationService:
                     raise XeroApiError(502, "OUTCOME_UNKNOWN", "The request failed and the current state could not be checked. Refresh and verify in Xero before retrying.") from None
                 if self._find_allocation(current, allocation_id) is None:
                     out["xeroResponse"] = {"isDeleted": None, "amount": None, "note": "Request errored but the allocation is gone (processed by Xero)."}
-                    break
+                    return
                 if attempt >= 2:
                     raise
                 # still present -> exactly one safe retry
 
+    def _verify_gone(self, after, allocation_id, out):
+        if self._find_allocation(after, allocation_id) is not None:
+            raise XeroApiError(502, "VERIFICATION_FAILED", "Xero responded but the allocation still appears on the document. It was NOT confirmed as removed.")
+        out["verification"] = {"documentStillExists": True, "allocationPresentAfter": False, "documentStatusAfter": after.get("Status")}
+
+    def _do_remove(self, ctx, mod, payload, out):
+        parent_id, allocation_id = payload["parentId"], payload["allocationId"]
+        self._guard_budget(ctx)
+        # 1. Pre-flight
+        parent = self._fetch_parent(ctx, mod, parent_id)
+        out["parentNumber"] = parent.get("CreditNoteNumber")
+        out["contactName"] = (parent.get("Contact") or {}).get("Name")
+        self._check_parent(mod, parent)
+        self._check_allocation(parent, payload, out)
+        # 2. DELETE - the allocation endpoint only
+        self._delete_one(ctx, mod, parent_id, allocation_id, out)
         # 3. Verify by re-fetching
         try:
             after = self._fetch_parent(ctx, mod, parent_id)
         except XeroApiError:
             raise XeroApiError(502, "VERIFICATION_FAILED", "Xero accepted the request but the verification re-fetch failed. Check the document in Xero.") from None
-        if self._find_allocation(after, allocation_id) is not None:
-            raise XeroApiError(502, "VERIFICATION_FAILED", "Xero responded but the allocation still appears on the document. It was NOT confirmed as removed.")
-        out["verification"] = {"documentStillExists": True, "allocationPresentAfter": False, "documentStatusAfter": after.get("Status")}
+        self._verify_gone(after, allocation_id, out)
+
+    # ---- result helpers (shared by single and grouped removal)
+    @staticmethod
+    def _new_out(module_key, item):
+        item = item if isinstance(item, dict) else {}
+        return {"ok": False, "module": module_key, "parentId": item.get("parentId"), "allocationId": item.get("allocationId"),
+                "processedAt": _now_iso()}
+
+    @staticmethod
+    def _set_failed(out, exc):
+        out.update(ok=False, status="UNVERIFIED" if exc.code in ("VERIFICATION_FAILED", "OUTCOME_UNKNOWN") else "FAILED",
+                   errorCode=exc.code, message=exc.message, httpStatus=exc.status)
+        if getattr(exc, "retry_after", None):
+            out["retryAfter"] = exc.retry_after
+        return out
+
+    @staticmethod
+    def _set_skipped(out, code, message, retry_after=None):
+        out.update(ok=False, status="SKIPPED", errorCode=code, message=message)
+        if retry_after:
+            out["retryAfter"] = retry_after
+        return out
+
+    @staticmethod
+    def _set_verified(out):
+        out.update(ok=True, status="REMOVED_VERIFIED", httpStatus=200,
+                   message="Allocation removed and verified by re-fetching the document. The document itself was not deleted.")
+        return out
+
+    @staticmethod
+    def _id_error(mod, item):
+        if not is_uuid(item.get("parentId")):
+            return XeroApiError(400, "INVALID_PARENT_ID", f"parentId must be a valid {mod['label']} ID (GUID).")
+        if not is_uuid(item.get("allocationId")):
+            return XeroApiError(400, "INVALID_ALLOCATION_ID", "allocationId must be a valid Allocation ID (GUID).")
+        return None
+
+    def _audit_result(self, ctx, module_key, out):
+        self.audit({"tenantId": ctx["tenant_id"], "module": module_key, "parentId": out["parentId"],
+                    "allocationId": out["allocationId"], "amount": out.get("amount"), "ok": out["ok"],
+                    "status": out.get("status"), "errorCode": out.get("errorCode")})
 
     def remove(self, ctx, module_key, payload):
         """Never raises for expected failures: returns a result dict (so a bulk run can collect per-item results)."""
         mod = MODULES[module_key]
         payload = payload if isinstance(payload, dict) else {}
         parent_id, allocation_id = payload.get("parentId"), payload.get("allocationId")
-        out = {"ok": False, "module": module_key, "parentId": parent_id, "allocationId": allocation_id, "processedAt": _now_iso()}
+        out = self._new_out(module_key, payload)
 
-        def fail(exc):
-            out.update(status="UNVERIFIED" if exc.code in ("VERIFICATION_FAILED", "OUTCOME_UNKNOWN") else "FAILED",
-                       errorCode=exc.code, message=exc.message, httpStatus=exc.status)
-            if getattr(exc, "retry_after", None):
-                out["retryAfter"] = exc.retry_after
-            return out
-
-        if not is_uuid(parent_id):
-            return fail(XeroApiError(400, "INVALID_PARENT_ID", f"parentId must be a valid {mod['label']} ID (GUID)."))
-        if not is_uuid(allocation_id):
-            return fail(XeroApiError(400, "INVALID_ALLOCATION_ID", "allocationId must be a valid Allocation ID (GUID)."))
+        err = self._id_error(mod, payload)
+        if err:
+            return self._set_failed(out, err)
 
         lock_key = f"{ctx['tenant_id']}:{allocation_id.lower()}"
         with self._lock:
             if lock_key in self._inflight:
-                return fail(XeroApiError(409, "DUPLICATE_IN_PROGRESS", "A removal for this allocation is already in progress."))
+                return self._set_failed(out, XeroApiError(409, "DUPLICATE_IN_PROGRESS", "A removal for this allocation is already in progress."))
             self._inflight.add(lock_key)
         try:
             self._do_remove(ctx, mod, payload, out)
-            out.update(ok=True, status="REMOVED_VERIFIED", httpStatus=200,
-                       message="Allocation removed and verified by re-fetching the document. The document itself was not deleted.")
+            self._set_verified(out)
         except XeroApiError as exc:
-            fail(exc)
+            self._set_failed(out, exc)
         except Exception as exc:  # noqa: BLE001 - last resort, never leak details
             log.error("unexpected removal error (%s)", type(exc).__name__)
-            fail(XeroApiError(500, "INTERNAL_ERROR", "Unexpected error while removing the allocation."))
+            self._set_failed(out, XeroApiError(500, "INTERNAL_ERROR", "Unexpected error while removing the allocation."))
         finally:
             with self._lock:
                 self._inflight.discard(lock_key)
             self.invalidate(ctx["tenant_id"])
-        self.audit({"tenantId": ctx["tenant_id"], "module": module_key, "parentId": out["parentId"],
-                    "allocationId": out["allocationId"], "amount": out.get("amount"), "ok": out["ok"],
-                    "status": out.get("status"), "errorCode": out.get("errorCode")})
+        self._audit_result(ctx, module_key, out)
         return out
 
+    def remove_group(self, ctx, module_key, parent_id, items, deadline=None):
+        """Remove several allocations of ONE document with 1 pre-flight + N DELETEs + 1 verification (N + 2 Xero calls
+        instead of 3N). Every allocation is still checked against the freshly fetched document, still sent as its own
+        DELETE, and still confirmed by re-fetching the document afterwards. Same result shape as remove(); results are
+        returned in the order of `items`. deadline: clock() value after which the not-yet-started allocations are
+        SKIPPED/TIME_BUDGET (nothing sent to Xero for them)."""
+        mod = MODULES[module_key]
+        outs, active = [], []
+        for item in items:
+            item = item if isinstance(item, dict) else {}
+            outs.append(self._new_out(module_key, item))
+        locked = []
+        try:
+            for item, out in zip(items, outs):
+                err = self._id_error(mod, item) if isinstance(item, dict) else XeroApiError(400, "INVALID_PARENT_ID", "Invalid item.")
+                if err is None and str(item["parentId"]).lower() != str(parent_id).lower():
+                    err = XeroApiError(400, "INVALID_PARENT_ID", "Allocation does not belong to this document.")
+                if err:
+                    self._set_failed(out, err)
+                    continue
+                lock_key = f"{ctx['tenant_id']}:{item['allocationId'].lower()}"
+                with self._lock:
+                    if lock_key in self._inflight:
+                        self._set_failed(out, XeroApiError(409, "DUPLICATE_IN_PROGRESS", "A removal for this allocation is already in progress."))
+                        continue
+                    self._inflight.add(lock_key)
+                locked.append(lock_key)
+                active.append((item, out))
+            if active:
+                try:
+                    self._run_group(ctx, mod, module_key, parent_id, active, deadline)
+                except Exception as exc:  # noqa: BLE001 - last resort, never leak details
+                    log.error("unexpected removal error (%s)", type(exc).__name__)
+                    for _, out in active:
+                        if not out.get("status"):
+                            self._set_failed(out, XeroApiError(500, "INTERNAL_ERROR", "Unexpected error while removing the allocation."))
+        finally:
+            with self._lock:
+                for key in locked:
+                    self._inflight.discard(key)
+            self.invalidate(ctx["tenant_id"])
+        for out in outs:
+            if out.get("status") != "SKIPPED":
+                self._audit_result(ctx, module_key, out)
+        return outs
+
+    def _run_group(self, ctx, mod, module_key, parent_id, active, deadline):
+        # 1. ONE pre-flight for the whole document
+        try:
+            self._guard_budget(ctx)
+            parent = self._fetch_parent(ctx, mod, parent_id)
+            self._check_parent(mod, parent)
+        except XeroApiError as exc:
+            if exc.code in FATAL_CODES or exc.code == "RATE_LIMITED":
+                # Same rule as a sequential run: the first allocation reports the error, the rest are not started.
+                for n, (_, out) in enumerate(active):
+                    if n == 0:
+                        self._set_failed(out, exc)
+                    else:
+                        self._set_skipped(out, exc.code, "Skipped because an earlier item hit a connection or limit error.", exc.retry_after)
+            else:
+                for _, out in active:
+                    self._set_failed(out, exc)
+            return
+        number, contact = parent.get("CreditNoteNumber"), (parent.get("Contact") or {}).get("Name")
+        # 2. one DELETE per allocation
+        deleted, abort, started = [], None, False
+        for item, out in active:
+            out["parentNumber"], out["contactName"] = number, contact
+            if abort:
+                self._set_skipped(out, abort[0], "Skipped because an earlier item hit a connection or limit error.", abort[1])
+                continue
+            if started and deadline is not None and self.clock() >= deadline:
+                self._set_skipped(out, "TIME_BUDGET", "Not started yet (request time budget reached). Send again.")
+                continue
+            started = True
+            try:
+                self._check_allocation(parent, item, out)
+                self._guard_budget(ctx)
+                self._delete_one(ctx, mod, parent_id, item["allocationId"], out)
+                deleted.append((item, out))
+            except XeroApiError as exc:
+                self._set_failed(out, exc)
+                if exc.code in FATAL_CODES or exc.code == "RATE_LIMITED":
+                    abort = (exc.code, exc.retry_after)
+        # 3. ONE verification for everything that was deleted
+        if not deleted:
+            return
+        try:
+            after = self._fetch_parent(ctx, mod, parent_id)
+        except XeroApiError:
+            for _, out in deleted:
+                self._set_failed(out, XeroApiError(502, "VERIFICATION_FAILED", "Xero accepted the request but the verification re-fetch failed. Check the document in Xero."))
+            return
+        for item, out in deleted:
+            try:
+                self._verify_gone(after, item["allocationId"], out)
+                self._set_verified(out)
+            except XeroApiError as exc:
+                self._set_failed(out, exc)
+
     def remove_bulk(self, ctx, module_key, items, budget=None, max_items=MAX_BULK):
-        """budget (seconds): once exceeded, the remaining items are returned as SKIPPED/TIME_BUDGET (nothing was sent
-        to Xero for them) so the caller can send them again in the next request."""
+        """Allocations of the same document are removed together (see remove_group), which saves Xero API calls.
+        budget (seconds): once exceeded, the remaining items are returned as SKIPPED/TIME_BUDGET (nothing was sent
+        to Xero for them) so the caller can send them again in the next request. Results keep the order of `items`."""
         if not isinstance(items, list) or not items:
             raise XeroApiError(400, "NO_ITEMS", "Select at least one allocation.")
         if len(items) > max_items:
             raise XeroApiError(400, "TOO_MANY_ITEMS", f"At most {max_items} allocations per request.")
-        results, seen, aborted, abort_retry = [], set(), None, None
+        mod = MODULES[module_key]
+        results, seen, groups = [None] * len(items), set(), {}
+        aborted, abort_retry = None, None
         started = self.clock()
+        deadline = None if budget is None else started + budget
 
         def skipped(item, code, message):
-            item = item if isinstance(item, dict) else {}
-            return {"ok": False, "status": "SKIPPED", "module": module_key, "parentId": item.get("parentId"),
-                    "allocationId": item.get("allocationId"), "errorCode": code, "message": message, "processedAt": _now_iso()}
+            return self._set_skipped(self._new_out(module_key, item), code, message)
 
-        for item in items:
+        # Group by document, in order of first appearance. Anything invalid stays on its own (it fails fast, no Xero call).
+        for i, item in enumerate(items):
             alloc_id = str((item or {}).get("allocationId") or "").lower() if isinstance(item, dict) else ""
-            if aborted:
-                res = skipped(item, aborted, "Skipped because an earlier item hit a connection or limit error.")
-                if abort_retry:
-                    res["retryAfter"] = abort_retry
-                results.append(res)
-                continue
             if alloc_id and alloc_id in seen:
-                results.append(skipped(item, "DUPLICATE_IN_REQUEST", "Duplicate allocation in this request."))
-                continue
-            if budget is not None and results and self.clock() - started >= budget:
-                results.append(skipped(item, "TIME_BUDGET", "Not started yet (request time budget reached). Send again."))
+                results[i] = skipped(item, "DUPLICATE_IN_REQUEST", "Duplicate allocation in this request.")
                 continue
             if alloc_id:
                 seen.add(alloc_id)
-            res = self.remove(ctx, module_key, item)
-            results.append(res)
-            if not res["ok"] and (res.get("errorCode") in FATAL_CODES or res.get("errorCode") == "RATE_LIMITED"):
-                aborted, abort_retry = res["errorCode"], res.get("retryAfter")   # RATE_LIMITED: stop the chunk; nothing was processed, the caller waits and resends
+            valid = isinstance(item, dict) and self._id_error(mod, item) is None
+            key = str(item["parentId"]).lower() if valid else ("single", i)
+            groups.setdefault(key, []).append(i)
+
+        processed_any = False
+        for key, idxs in groups.items():
+            if aborted:
+                for i in idxs:
+                    res = skipped(items[i], aborted, "Skipped because an earlier item hit a connection or limit error.")
+                    if abort_retry:
+                        res["retryAfter"] = abort_retry
+                    results[i] = res
+                continue
+            if deadline is not None and processed_any and self.clock() >= deadline:
+                for i in idxs:
+                    results[i] = skipped(items[i], "TIME_BUDGET", "Not started yet (request time budget reached). Send again.")
+                continue
+            processed_any = True
+            if len(idxs) == 1:
+                group_results = [self.remove(ctx, module_key, items[idxs[0]])]
+            else:
+                group_results = self.remove_group(ctx, module_key, items[idxs[0]]["parentId"], [items[i] for i in idxs], deadline)
+            for i, res in zip(idxs, group_results):
+                results[i] = res
+            for res in group_results:
+                if not res["ok"] and res.get("status") != "SKIPPED" and (res.get("errorCode") in FATAL_CODES or res.get("errorCode") == "RATE_LIMITED"):
+                    aborted, abort_retry = res["errorCode"], res.get("retryAfter")   # RATE_LIMITED: stop the chunk; nothing was processed, the caller waits and resends
+                    break
         ok = sum(1 for r in results if r["ok"])
         skip = sum(1 for r in results if r.get("status") == "SKIPPED")
-        return {"results": results, "summary": {"total": len(results), "succeeded": ok, "failed": len(results) - ok - skip, "skipped": skip}}
+        return {"results": results, "summary": {"total": len(results), "succeeded": ok, "failed": len(results) - ok - skip, "skipped": skip},
+                "limits": self.limits(ctx)}
 
 
 # ------------------------------------------------------------------------------------------- blueprint
@@ -566,7 +755,7 @@ def register(app, *, get_valid_token, force_refresh, get_tenant_info):
     def status():
         ctx = context()
         return jsonify({"organisation": ctx["tenant_name"], "removalAllowed": tenant_allowed(ctx["tenant_id"]),
-                        "stats": service.audit_stats(ctx["tenant_id"])})
+                        "stats": service.audit_stats(ctx["tenant_id"]), "limits": service.limits(ctx)})
 
     @bp.get("/api/<module>/list")
     def list_allocations(module):
