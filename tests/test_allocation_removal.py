@@ -21,6 +21,7 @@ class RemovalTestCase(AppTestCase):
         self.service = app_module.app.extensions["allocation_removal"]
         self.service._cache.clear()
         self.service._inflight.clear()
+        self.service.xero._limits.clear()
         stack = self.xero.patchers()
         stack.__enter__()
         self.addCleanup(stack.close)
